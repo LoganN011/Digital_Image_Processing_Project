@@ -1,1 +1,2 @@
-# Digital_Image_Processing_Project
+# Digital Image Processing Project
+Authors: Tauha Khan, Logan Nunno, Dawud Shakir
