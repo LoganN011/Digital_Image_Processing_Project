@@ -47,10 +47,8 @@ class PosterReaderApp(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(self.stack)
 
-
         self.timer = QTimer()
         self.timer.timeout.connect(self.process_frame)
-
 
     def init_menu_screen(self):
         page = QWidget()
@@ -176,7 +174,7 @@ class PosterReaderApp(QWidget):
                         background-color: transparent;
                     }
                     QPushButton:hover {
-                        border: 2px solid #0078d7; 
+                        border: 2px solid #0078d7;
                         background-color: rgba(0, 120, 215, 20);
                     }
                 """)
