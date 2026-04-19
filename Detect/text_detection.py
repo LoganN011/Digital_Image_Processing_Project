@@ -107,10 +107,10 @@ for y in range(0, scores.shape[2]):
 		if scoresData[x] < args["min_confidence"]:
 			continue
 		
-        # Need offset factor as our resulting feature maps will be 4x smaller than the input image
+        # Need offset factor as the resulting feature maps will be 4x smaller than the input image
 		(offsetX, offsetY) = (x * 4.0, y * 4.0)
 		
-		# Extract the rotation angle for the prediction and then compute the sin and cosine
+		# Extract the rotation angle for the prediction and then compute the sine and cosine
 		angle = anglesData[x]
 		cos = np.cos(angle)
 		sin = np.sin(angle)
