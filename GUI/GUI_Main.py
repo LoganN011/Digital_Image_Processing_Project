@@ -7,6 +7,8 @@ from PyQt6.QtGui import QPixmap, QImage, QIcon
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QPushButton, QVBoxLayout, QLabel, QWidget, \
     QScrollArea, QGridLayout, QStackedWidget
 
+from GUI.audio_engine import AudioEngine
+
 
 class VideoSourceManager:
     def __init__(self):
@@ -49,6 +51,8 @@ class PosterReaderApp(QWidget):
 
         self.timer = QTimer()
         self.timer.timeout.connect(self.process_frame)
+
+        self.speaker = AudioEngine()
 
     def init_menu_screen(self):
         page = QWidget()
@@ -179,10 +183,14 @@ class PosterReaderApp(QWidget):
                     }
                 """)
 
-        btn.clicked.connect(lambda checked, t=detected_text: self.ocr_result_label.setText(t))
+        btn.clicked.connect(lambda checked, t=detected_text: on_poster_click(t))
 
         count = self.grid_layout.count()
         self.grid_layout.addWidget(btn, count // 4, count % 4)
+
+        def on_poster_click(text):
+            self.ocr_result_label.setText(text)
+            self.speaker.speak(text)
 
 
 if __name__ == '__main__':
