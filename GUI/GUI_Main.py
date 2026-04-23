@@ -3,13 +3,71 @@ import sys
 import cv2
 from PIL import Image
 from PyQt6 import QtGui
-from PyQt6.QtCore import QTimer, Qt
-from PyQt6.QtGui import QPixmap, QImage, QIcon
-from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QPushButton, QVBoxLayout, QLabel, QWidget, \
-    QScrollArea, QGridLayout, QStackedWidget
+from PyQt6.QtCore import QTimer, Qt, QPoint
+from PyQt6.QtGui import QPixmap, QImage, QIcon, QPainter
+from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QPushButton, QVBoxLayout, QHBoxLayout, \
+    QLabel, QWidget, QScrollArea, QGridLayout, QStackedWidget, QDialog
 
 from audio_engine import AudioEngine
 from caption_engine import ImageCaptioner
+
+
+class ZoomableImageLabel(QLabel):
+    """A QLabel that supports zoom (scroll wheel) and pan (click + drag)."""
+    def __init__(self, pixmap, parent=None):
+        super().__init__(parent)
+        self._original_pixmap = pixmap
+        self._zoom = 1.0
+        self._pan_offset = QPoint(0, 0)
+        self._drag_start = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(400, 400)
+        self._update_display()
+
+    def _update_display(self):
+        scaled_w = int(self._original_pixmap.width() * self._zoom)
+        scaled_h = int(self._original_pixmap.height() * self._zoom)
+        scaled = self._original_pixmap.scaled(
+            scaled_w, scaled_h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+        
+        canvas = QPixmap(self.size())
+        canvas.fill(Qt.GlobalColor.black)
+        painter = QPainter(canvas)
+        x = (self.width() - scaled.width()) // 2 + self._pan_offset.x()
+        y = (self.height() - scaled.height()) // 2 + self._pan_offset.y()
+        painter.drawPixmap(x, y, scaled)
+        painter.end()
+        self.setPixmap(canvas)
+
+    def wheelEvent(self, event):
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self._zoom = min(self._zoom * 1.15, 10.0)
+        else:
+            self._zoom = max(self._zoom / 1.15, 0.1)
+        self._update_display()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = event.pos()
+
+    def mouseMoveEvent(self, event):
+        if self._drag_start is not None:
+            delta = event.pos() - self._drag_start
+            self._pan_offset += delta
+            self._drag_start = event.pos()
+            self._update_display()
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start = None
+
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_display()
 
 
 class VideoSourceManager:
@@ -126,13 +184,15 @@ class PosterReaderApp(QWidget):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        self.ocr_result_label = QLabel("Click a poster to see its text")
+        self.ocr_result_label = QLabel("Click a poster to see its text. Double-click to zoom.")
         self.ocr_result_label.setWordWrap(True)
         layout.addWidget(self.ocr_result_label)
 
         scroll = QScrollArea()
         self.grid_widget = QWidget()
         self.grid_layout = QGridLayout(self.grid_widget)
+        self.grid_layout.setSpacing(6)
+        self.grid_layout.setContentsMargins(4, 4, 4, 4)
         scroll.setWidget(self.grid_widget)
         scroll.setWidgetResizable(True)
 
@@ -161,7 +221,7 @@ class PosterReaderApp(QWidget):
 
         if isinstance(image_input, str):
             # It's a file path
-            pixmap = QPixmap(image_input)
+            full_pixmap = QPixmap(image_input)
             pil_image = Image.open(image_input).convert('RGB')
         else:
             #TODO TEST THIS WHEN OTHER FUNCTIONS ARE DONE
@@ -172,34 +232,31 @@ class PosterReaderApp(QWidget):
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
 
-            # Create QImage then QPixmap
             q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-            pixmap = QPixmap.fromImage(q_img)
+            full_pixmap = QPixmap.fromImage(q_img)
 
             pil_image = Image.fromarray(rgb_image)
 
         short_description = self.captioner.generate_caption(pil_image)
         btn.setToolTip(f"Description: {short_description}")
 
-        if pixmap.width() > pixmap.height():
-            transform = QtGui.QTransform().rotate(90)
-            pixmap = pixmap.transformed(transform)
-
-        pixmap = pixmap.scaled(
-            150, 150,
+        thumb_max = 220
+        thumbnail = full_pixmap.scaled(
+            thumb_max, thumb_max,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation
         )
 
-        btn.setIcon(QIcon(pixmap))
-        btn.setIconSize(pixmap.size())
-        btn.setFixedSize(160, 160)
+        btn.setIcon(QIcon(thumbnail))
+        btn.setIconSize(thumbnail.size())
+        btn.setFixedSize(thumbnail.width() + 8, thumbnail.height() + 8)
 
         btn.setStyleSheet("""
                     QPushButton {
                         border: 2px solid transparent;
-                        border-radius: 5px;
+                        border-radius: 3px;
                         background-color: transparent;
+                        padding: 2px;
                     }
                     QPushButton:hover {
                         border: 2px solid #0078d7;
@@ -207,14 +264,37 @@ class PosterReaderApp(QWidget):
                     }
                 """)
 
-        btn.clicked.connect(lambda checked, t=detected_text: on_poster_click(t))
+        def on_poster_click(text, pixmap):
+            self.ocr_result_label.setText(text)
+            self.speaker.speak(text)
+            self.show_zoom_dialog(pixmap, text)
+
+        btn.clicked.connect(lambda checked, t=detected_text, p=full_pixmap: on_poster_click(t, p))
 
         count = self.grid_layout.count()
         self.grid_layout.addWidget(btn, count // 4, count % 4)
 
-        def on_poster_click(text):
-            self.ocr_result_label.setText(text)
-            self.speaker.speak(text)
+    def show_zoom_dialog(self, pixmap, text):
+        """Opens a dialog with the full-resolution poster that supports zoom and pan."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Poster Viewer - Scroll to zoom, drag to pan")
+        dialog.resize(800, 700)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        zoom_label = ZoomableImageLabel(pixmap, dialog)
+        zoom_label.setSizePolicy(zoom_label.sizePolicy())
+        layout.addWidget(zoom_label, stretch=1)
+
+        # Text label at the bottom
+        text_label = QLabel(text)
+        text_label.setWordWrap(True)
+        text_label.setMaximumHeight(80)
+        text_label.setStyleSheet("padding: 8px; background-color: #1e1e1e; color: white;")
+        layout.addWidget(text_label)
+
+        dialog.exec()
 
 
 if __name__ == '__main__':
