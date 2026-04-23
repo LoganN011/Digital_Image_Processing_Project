@@ -21,3 +21,43 @@ The GUI requires the following Python packages:
 ```bash
 pip install PyQt6 opencv-python Pillow pyttsx3 transformers torch easyocr numpy
 ```
+
+# Keyboard Shortcuts
+
+The GUI is fully navigable without a mouse.
+
+### Menu Screen
+
+| Key | Action |
+|-----|--------|
+| `1` | Select Video File |
+| `2` | Start Live Record |
+
+### Processing Screen
+
+| Key | Action |
+|-----|--------|
+| `Space` | Finish and view posters |
+| `Escape` | Finish and view posters |
+
+### Results Screen
+
+| Key | Action |
+|-----|--------|
+| `←` `→` | Move between posters (left/right) |
+| `↑` `↓` | Move between poster rows (up/down) |
+| `Enter` | Open focused poster in zoom view + TTS |
+| `Tab` | Cycle through posters |
+| `T` | Load test images |
+
+When a poster is focused via keyboard, its AI-generated description is shown at the top of the screen.
+
+### Zoom / Poster Viewer
+
+| Key | Action |
+|-----|--------|
+| `+` / `=` | Zoom in |
+| `-` | Zoom out |
+| `←` `→` `↑` `↓` | Pan the image |
+| `0` | Reset zoom and pan |
+| `Escape` | Close viewer |
