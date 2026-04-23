@@ -8,8 +8,8 @@ from PyQt6.QtGui import QPixmap, QImage, QIcon
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QPushButton, QVBoxLayout, QLabel, QWidget, \
     QScrollArea, QGridLayout, QStackedWidget
 
-from GUI.audio_engine import AudioEngine
-from GUI.caption_engine import ImageCaptioner
+from audio_engine import AudioEngine
+from caption_engine import ImageCaptioner
 
 
 class VideoSourceManager:

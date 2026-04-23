@@ -10,6 +10,6 @@ class ImageCaptioner:
     def generate_caption(self, pil_image):
         """Generates a short description of the poster image."""
         inputs = self.processor(pil_image, return_tensors="pt")
-        out = self.model.generate(**inputs)
+        out = self.model.generate(**inputs,max_length=50)
 
         return self.processor.decode(out[0], skip_special_tokens=True)
