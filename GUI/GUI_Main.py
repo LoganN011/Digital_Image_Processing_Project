@@ -1,15 +1,18 @@
 import sys
+import queue
 
 import cv2
 from PIL import Image
 from PyQt6 import QtGui
 from PyQt6.QtCore import QTimer, Qt, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QPainter, QKeySequence, QShortcut
-from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QPushButton, QVBoxLayout, QHBoxLayout, \
-    QLabel, QWidget, QScrollArea, QGridLayout, QStackedWidget, QDialog
+from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QPushButton, QVBoxLayout, \
+    QLabel, QWidget, QScrollArea, QGridLayout, QStackedWidget, QDialog, QProgressBar
 
 from audio_engine import AudioEngine
 from caption_engine import ImageCaptioner
+from sam_engine import SAMWorker
+from dino_engine import DINOWorker
 
 
 class ZoomableImageLabel(QLabel):
@@ -118,12 +121,40 @@ class VideoSourceManager:
         return self.cap
 
 
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer, Qt, QPoint
+
+class CaptionWorker(QThread):
+    caption_ready = pyqtSignal(object, str)
+
+    def __init__(self, captioner):
+        super().__init__()
+        self.captioner = captioner
+        self.queue = queue.Queue()
+
+    def add_task(self, poster_id, pil_image):
+        self.queue.put((poster_id, pil_image))
+
+    def run(self):
+        while True:
+            poster_id, pil_image = self.queue.get()
+            if pil_image is None: break
+            try:
+                caption = self.captioner.generate_caption(pil_image)
+                self.caption_ready.emit(poster_id, caption)
+            except Exception as e:
+                print(f"Caption error: {e}")
+            self.queue.task_done()
+
+
 class PosterReaderApp(QWidget):
     def __init__(self):
         super().__init__()
         self.manager = VideoSourceManager()
         self.current_cap = None
         self.found_posters = []
+        self.is_live_camera = False
+        self.video_path = None
+        self.temp_video_writer = None
 
         self.setWindowTitle("UNM Poster Reader")
         self.resize(1000, 700)
@@ -142,6 +173,12 @@ class PosterReaderApp(QWidget):
         self.speaker = AudioEngine()
 
         self.captioner = ImageCaptioner()
+        self.poster_id_to_button = {}
+        
+        # Background Captioning Setup
+        self.caption_worker = CaptionWorker(self.captioner)
+        self.caption_worker.caption_ready.connect(self.on_caption_ready)
+        self.caption_worker.start()
 
     def init_menu_screen(self):
         page = QWidget()
@@ -166,6 +203,8 @@ class PosterReaderApp(QWidget):
         cap, path = self.manager.select_file()
         if cap:
             self.current_cap = cap
+            self.is_live_camera = False
+            self.video_path = path
             self.start_pipeline()
 
     def run_camera_input(self):
@@ -174,6 +213,15 @@ class PosterReaderApp(QWidget):
         cap = self.manager.start_camera()
         if cap:
             self.current_cap = cap
+            self.is_live_camera = True
+            self.video_path = "temp_record.mp4"
+            
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            self.temp_video_writer = cv2.VideoWriter(self.video_path, fourcc, fps, (width, height))
+            
             self.start_pipeline()
 
     def start_pipeline(self):
@@ -202,8 +250,8 @@ class PosterReaderApp(QWidget):
             self.stop_processing()
             return
 
-        # PIPELINE HERE
-        # here is where we need to add the tracking of the posters to show on the frame
+        if self.is_live_camera and self.temp_video_writer is not None:
+            self.temp_video_writer.write(frame)
 
         # Display the frame in the GUI
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -217,7 +265,79 @@ class PosterReaderApp(QWidget):
         self.timer.stop()
         if self.current_cap:
             self.current_cap.release()
+            
+        if self.is_live_camera and self.temp_video_writer is not None:
+            self.temp_video_writer.release()
+            self.temp_video_writer = None
+            
+        self.start_model_processing()
+
+    def start_model_processing(self):
+        """Spawns the worker thread for the selected vision engine."""
+        self.poster_id_to_button = {}
+        # Clear existing posters from gallery
+        while self.grid_layout.count():
+            item = self.grid_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        self.poster_buttons = []
+        self.poster_data = []
+        self.focused_poster_index = -1
+
+        # Switch to results screen immediately
         self.stack.setCurrentIndex(2)
+        self.results_progress_bar.setVisible(True)
+        self.results_status_label.setVisible(True)
+        self.btn_stop_proc.setVisible(True)
+        self.results_progress_bar.setValue(0)
+        self.results_status_label.setText("Starting model processing...")
+
+        # --- MODEL SELECTION ---
+        # Uncomment the model you wish to use:
+        # self.model_worker = SAMWorker(self.video_path)
+        self.model_worker = DINOWorker(self.video_path)
+        # -----------------------
+
+        self.model_worker.progress.connect(self.on_progress)
+        self.model_worker.poster_found.connect(self.on_poster_found)
+        self.model_worker.finished_processing.connect(self.on_model_finished)
+        self.model_worker.error.connect(self.on_error)
+        self.model_worker.start()
+
+    def on_progress(self, pct, status):
+        # Update the bar on the results screen
+        self.results_progress_bar.setValue(pct)
+        self.results_status_label.setText(status)
+
+    def on_error(self, err_msg):
+        QMessageBox.critical(self, "Model Error", err_msg)
+        self.stack.setCurrentIndex(0) # Go back to menu
+
+    def on_poster_found(self, poster_id, image_array):
+        """Callback for live updates when a new poster or a better crop is found."""
+        # Use a mock OCR text for now, as real OCR happens later or on-click
+        mock_text = f"Poster {poster_id+1} detected"
+        
+        if poster_id in self.poster_id_to_button:
+            # Update existing poster
+            self.update_poster_in_gallery(poster_id, image_array, mock_text)
+        else:
+            # Add new poster
+            self.add_poster_to_gallery(image_array, mock_text, poster_id=poster_id)
+
+    def on_model_finished(self, results, output_path=None):
+        self.results_progress_bar.setVisible(False)
+        self.btn_stop_proc.setVisible(False)
+        self.results_status_label.setText(f"Processing complete. Found {len(self.poster_data)} posters.")
+
+    def stop_model_processing(self):
+        """Stops the current vision engine worker early."""
+        if hasattr(self, 'model_worker') and self.model_worker.isRunning():
+            self.model_worker.terminate()
+            self.model_worker.wait()
+            self.on_model_finished(None)
+            self.results_status_label.setText(f"Stopped by user. Found {len(self.poster_data)} posters.")
 
     def init_results_screen(self):
         page = QWidget()
@@ -242,10 +362,29 @@ class PosterReaderApp(QWidget):
         btn_test.clicked.connect(self.load_test_posters)
         layout.addWidget(btn_test)
 
+        # Processing status UI (at the bottom)
+        self.results_status_label = QLabel("")
+        self.results_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.results_status_label.setVisible(False)
+        layout.addWidget(self.results_status_label)
+
+        self.results_progress_bar = QProgressBar()
+        self.results_progress_bar.setRange(0, 100)
+        self.results_progress_bar.setValue(0)
+        self.results_progress_bar.setVisible(False)
+        layout.addWidget(self.results_progress_bar)
+
+        self.btn_stop_proc = QPushButton("Stop Processing  [X]")
+        self.btn_stop_proc.setStyleSheet("background-color: #d32f2f; color: white; font-weight: bold; padding: 5px;")
+        self.btn_stop_proc.setVisible(False)
+        self.btn_stop_proc.clicked.connect(self.stop_model_processing)
+        layout.addWidget(self.btn_stop_proc)
+
         page.setLayout(layout)
         self.stack.addWidget(page)
 
         QShortcut(QKeySequence("T"), self, activated=self.load_test_posters)
+        QShortcut(QKeySequence("X"), self, activated=self.stop_model_processing)
 
         self.poster_buttons = []
         self.poster_data = []
@@ -262,7 +401,7 @@ class PosterReaderApp(QWidget):
             mock_ocr_text = f"OCR Output for {file_path.split('/')[-1]}: Sample Text Detected"
             self.add_poster_to_gallery(file_path, mock_ocr_text)
 
-    def add_poster_to_gallery(self, image_input, detected_text):
+    def add_poster_to_gallery(self, image_input, detected_text, poster_id=None):
         """Adds a clickable thumbnail and handles rotation."""
         btn = QPushButton()
 
@@ -271,10 +410,6 @@ class PosterReaderApp(QWidget):
             full_pixmap = QPixmap(image_input)
             pil_image = Image.open(image_input).convert('RGB')
         else:
-            #TODO TEST THIS WHEN OTHER FUNCTIONS ARE DONE
-
-            # It's a NumPy array (OpenCV frame)
-            # Convert BGR to RGB for PIL and QImage
             rgb_image = cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
             h, w, ch = rgb_image.shape
             bytes_per_line = ch * w
@@ -283,9 +418,10 @@ class PosterReaderApp(QWidget):
             full_pixmap = QPixmap.fromImage(q_img)
 
             pil_image = Image.fromarray(rgb_image)
-
-        short_description = self.captioner.generate_caption(pil_image)
-        btn.setToolTip(f"Description: {short_description}")
+            
+        # Queue background captioning
+        self.caption_worker.add_task(poster_id if poster_id is not None else len(self.poster_buttons)-1, pil_image)
+        btn.setToolTip("Generating description...")
 
         thumb_max = 220
         thumbnail = full_pixmap.scaled(
@@ -312,7 +448,7 @@ class PosterReaderApp(QWidget):
                 """)
 
         self.poster_buttons.append(btn)
-        self.poster_data.append((detected_text, full_pixmap, short_description))
+        self.poster_data.append((detected_text, full_pixmap, "Processing..."))
 
         def on_poster_click(text, pixmap):
             self.ocr_result_label.setText(text)
@@ -322,8 +458,74 @@ class PosterReaderApp(QWidget):
         btn.clicked.connect(lambda checked, t=detected_text, p=full_pixmap: on_poster_click(t, p))
         btn.installEventFilter(self)
 
+        if poster_id is not None:
+            self.poster_id_to_button[poster_id] = btn
+
         count = self.grid_layout.count()
         self.grid_layout.addWidget(btn, count // 4, count % 4)
+
+    def on_caption_ready(self, poster_id_or_idx, description):
+        """Updates the gallery button tooltip and data once captioning is done."""
+        # Check if it's a direct ID in our map
+        btn = self.poster_id_to_button.get(poster_id_or_idx)
+        idx = -1
+        
+        if btn:
+            try:
+                idx = self.poster_buttons.index(btn)
+            except ValueError:
+                pass
+        elif isinstance(poster_id_or_idx, int) and 0 <= poster_id_or_idx < len(self.poster_buttons):
+            # It's a raw index
+            idx = poster_id_or_idx
+            btn = self.poster_buttons[idx]
+
+        if btn and idx != -1:
+            btn.setToolTip(f"Description: {description}")
+            # Update the stored data so arrow keys show the real description
+            text, pix, _ = self.poster_data[idx]
+            self.poster_data[idx] = (text, pix, description)
+            
+            # If this poster is currently focused, update the label too
+            if self.focused_poster_index == idx:
+                self.ocr_result_label.setText(f"Description: {description}")
+
+    def update_poster_in_gallery(self, poster_id, image_input, detected_text):
+        """Updates an existing poster's thumbnail and data."""
+        btn = self.poster_id_to_button.get(poster_id)
+        if not btn:
+            return
+
+        # Prepare new images
+        if isinstance(image_input, str):
+            full_pixmap = QPixmap(image_input)
+            pil_image = Image.open(image_input).convert('RGB')
+        else:
+            rgb_image = cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            bytes_per_line = ch * w
+            q_img = QImage(rgb_image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            full_pixmap = QPixmap.fromImage(q_img)
+            pil_image = Image.fromarray(rgb_image)
+
+        # Update metadata in poster_data
+        try:
+            btn_idx = self.poster_buttons.index(btn)
+            # Re-queue captioning for the new, better image
+            self.caption_worker.add_task(poster_id if poster_id is not None else btn_idx, pil_image)
+            
+            text, _, _ = self.poster_data[btn_idx]
+            self.poster_data[btn_idx] = (text, full_pixmap, "Updating description...")
+        except ValueError:
+            pass
+
+        btn.setToolTip("Updating description...")
+        btn.clicked.disconnect()
+        def on_poster_click(text, pixmap):
+            self.ocr_result_label.setText(text)
+            self.speaker.speak(text)
+            self.show_zoom_dialog(pixmap, text)
+        btn.clicked.connect(lambda checked, t=detected_text, p=full_pixmap: on_poster_click(t, p))
 
     def eventFilter(self, obj, event):
         """When a poster button gains focus, show its description in the label."""
@@ -337,8 +539,8 @@ class PosterReaderApp(QWidget):
 
     def keyPressEvent(self, event):
         """Handle arrow key navigation and Enter to open poster in results screen."""
-        # Only handle when on the results screen (index 2)
-        if self.stack.currentIndex() != 2 or not self.poster_buttons:
+        # Only handle when on the results screen (index 3)
+        if self.stack.currentIndex() != 3 or not self.poster_buttons:
             super().keyPressEvent(event)
             return
 
