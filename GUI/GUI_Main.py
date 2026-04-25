@@ -4,6 +4,8 @@ import queue
 
 import cv2
 from PIL import Image
+import threading
+
 from PyQt6 import QtGui
 from PyQt6.QtCore import QTimer, Qt, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QPainter, QKeySequence, QShortcut
@@ -156,21 +158,58 @@ class OCRWorker(QThread):
     def __init__(self, ocr_engine):
         super().__init__()
         self.ocr_engine = ocr_engine
-        self.queue = queue.Queue()
+        self.pending_tasks = {} # poster_id -> (image, options)
+        self._lock = threading.Lock()
+        self._running = True
 
     def add_task(self, poster_id, image_input, preprocess_options):
-        self.queue.put((poster_id, image_input, preprocess_options))
+        with self._lock:
+            self.pending_tasks[poster_id] = (image_input, preprocess_options)
 
     def run(self):
-        while True:
-            poster_id, image_input, preprocess_options = self.queue.get()
-            if image_input is None: break
-            try:
-                text, conf = self.ocr_engine.get_text(image_input, preprocess_options)
-                self.ocr_ready.emit(poster_id, text, conf)
-            except Exception as e:
-                print(f"OCR worker error: {e}")
-            self.queue.task_done()
+        while self._running:
+            task = None
+            with self._lock:
+                if self.pending_tasks:
+                    # Get the first poster_id and its latest image/options
+                    pid = next(iter(self.pending_tasks))
+                    task = (pid, *self.pending_tasks.pop(pid))
+            
+            if task:
+                poster_id, image_input, options = task
+                try:
+                    # Pass 1: Raw Original Image
+                    raw_options = {"grayscale": False, "scale": 1.0, "threshold": False, "sharpen": False, "median": False}
+                    text_raw, conf_raw = self.ocr_engine.get_text(image_input, raw_options)
+                    
+                    # Pass 2: User's Preprocessed Image
+                    text_proc, conf_proc = self.ocr_engine.get_text(image_input, options)
+                    
+                    # Determine which result has higher confidence
+                    c_raw = conf_raw if conf_raw is not None else 0.0
+                    c_proc = conf_proc if conf_proc is not None else 0.0
+                    
+                    # Also consider if one produced text and the other didn't
+                    if text_raw == "No text detected." and text_proc != "No text detected.":
+                        best_text, best_conf = text_proc, conf_proc
+                    elif text_proc == "No text detected." and text_raw != "No text detected.":
+                        best_text, best_conf = text_raw, conf_raw
+                    elif c_proc > c_raw:
+                        best_text, best_conf = text_proc, conf_proc
+                    else:
+                        best_text, best_conf = text_raw, conf_raw
+                        
+                    self.ocr_ready.emit(poster_id, best_text, best_conf)
+                except Exception:
+                    pass
+            else:
+                self.msleep(100)
+
+    def stop(self):
+        self._running = False
+        self.wait()
+            
+class PosterReaderApp(QWidget):
     def __init__(self):
         super().__init__()
         self.manager = VideoSourceManager()
@@ -347,32 +386,23 @@ class OCRWorker(QThread):
         preprocess_options = self.get_preprocess_options()
         
         if poster_id in self.poster_id_to_button:
-            # Update existing poster: Re-queue OCR and Captioning
+            # Update existing poster
             btn = self.poster_id_to_button[poster_id]
             idx = self.poster_buttons.index(btn)
             
-            # Update pixmap in data
             rgb_image = cv2.cvtColor(image_array, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb_image.shape
-            q_img = QImage(rgb_image.data, w, h, ch * w, QImage.Format.Format_RGB888)
-            full_pixmap = QPixmap.fromImage(q_img)
-            pil_image = Image.fromarray(rgb_image)
+            full_pixmap = QPixmap.fromImage(QImage(rgb_image.data, rgb_image.shape[1], rgb_image.shape[0], rgb_image.shape[1]*3, QImage.Format.Format_RGB888))
             
             self.poster_data[idx]["pixmap"] = full_pixmap
             self.poster_data[idx]["image_input"] = image_array
             
             # Re-queue background tasks
-            self.caption_worker.add_task(poster_id, pil_image)
+            self.caption_worker.add_task(poster_id, Image.fromarray(rgb_image))
             self.ocr_worker.add_task(poster_id, image_array, preprocess_options)
-            
-            # Update button icon (preview)
             self.set_button_preview(btn, image_array)
         else:
-            # Add new poster with initial text
             initial_text = f"Poster {poster_id+1} detected. Processing..."
             self.add_poster_to_gallery(image_array, initial_text, poster_id=poster_id)
-            
-            # Real OCR will happen in background
             self.ocr_worker.add_task(poster_id, image_array, preprocess_options)
 
     def on_model_finished(self, results, output_path=None):
@@ -547,27 +577,15 @@ class OCRWorker(QThread):
             confidence_text = f"Average OCR confidence: {avg_conf:.2%}"
         
         self.poster_data.append({
-            "image_input": image_input,
+            "id": poster_id,
             "detected_text": detected_text,
             "pixmap": full_pixmap,
             "description": "Generating description...",
             "confidence": confidence_text,
+            "image_input": image_input
         })
 
-        def on_poster_click(text, pixmap, confidence, image_input):
-            display_text = f"{text}\n\n{confidence}"
-            self.ocr_result_label.setText(display_text)
-
-            # Only read detected text aloud, not confidence.
-            self.speaker.speak(text)
-
-            processed_pixmap = self.make_processed_pixmap(image_input)
-            self.show_zoom_dialog(pixmap, processed_pixmap, display_text)
-
-        btn.clicked.connect(
-            lambda checked=False, t=detected_text, p=full_pixmap, c=confidence_text, img=image_input:
-            on_poster_click(t, p, c, img)
-        )
+        btn.clicked.connect(lambda: self.on_poster_click(btn))
         btn.installEventFilter(self)
 
         if poster_id is not None:
@@ -579,6 +597,15 @@ class OCRWorker(QThread):
         if self.focused_poster_index == -1:
             self.focused_poster_index = 0
             self.poster_buttons[0].setFocus()
+
+    def on_poster_click(self, btn):
+        """When a gallery button is clicked, open the detail view."""
+        try:
+            idx = self.poster_buttons.index(btn)
+            self.focused_poster_index = idx
+            self.open_focused_poster()
+        except ValueError:
+            pass
 
     def on_caption_ready(self, poster_id_or_idx, description):
         """Updates the gallery button tooltip and data once captioning is done."""
@@ -598,23 +625,36 @@ class OCRWorker(QThread):
             if self.focused_poster_index == idx:
                 self.ocr_result_label.setText(f"Description: {description}")
 
-    def on_ocr_ready(self, poster_id_or_idx, text, confidence):
+    def on_ocr_ready(self, poster_id, text, confidence):
         """Updates the gallery data once OCR is done."""
-        btn = self.poster_id_to_button.get(poster_id_or_idx)
+        
+        # Find the index in poster_data that matches this ID
         idx = -1
-        if btn:
-            try:
-                idx = self.poster_buttons.index(btn)
-            except ValueError: pass
-        elif isinstance(poster_id_or_idx, int) and 0 <= poster_id_or_idx < len(self.poster_buttons):
-            idx = poster_id_or_idx
-
+        for i, data in enumerate(self.poster_data):
+            if data.get("id") == poster_id:
+                idx = i
+                break
+        
         if idx != -1:
             conf_text = f"Average OCR confidence: {confidence:.2%}" if confidence else "Average OCR confidence: N/A"
             self.poster_data[idx]["detected_text"] = text
             self.poster_data[idx]["confidence"] = conf_text
-            # If focused, maybe update label? 
-            # Actually, usually we wait for user to click to see OCR details.
+            
+            # Update button tooltip
+            btn = self.poster_buttons[idx]
+            desc = self.poster_data[idx].get("description", "Generating description...")
+            btn.setToolTip(f"Description: {desc}\nOCR: {text}")
+            
+            # If focused, refresh the top label (Gallery screen shows CAPTION only)
+            if self.focused_poster_index == idx:
+                desc = self.poster_data[idx].get("description", "Generating description...")
+                self.ocr_result_label.setText(f"Description: {desc}")
+            
+            # Update active dialog if it matches this poster ID
+            if hasattr(self, 'active_dialog') and self.active_dialog is not None:
+                if self.active_dialog_poster_id == poster_id:
+                    self.active_dialog_text_label.setText(f"{text}\n\n{conf_text}")
+                    self.speaker.speak(text)
 
     def keyPressEvent(self, event):
         """Handle arrow key navigation and Enter to open poster in results screen."""
@@ -711,19 +751,19 @@ class OCRWorker(QThread):
             self.poster_buttons[0].setFocus()
 
         poster = self.poster_data[self.focused_poster_index]
-
         text = poster["detected_text"]
         pixmap = poster["pixmap"]
         confidence = poster["confidence"]
         image_input = poster["image_input"]
+        tracking_id = poster.get("id")
 
         display_text = f"{text}\n\n{confidence}"
-
-        self.ocr_result_label.setText(display_text)
+        desc = poster.get("description", "Generating description...")
+        self.ocr_result_label.setText(f"Description: {desc}")
         self.speaker.speak(text)
 
         processed_pixmap = self.make_processed_pixmap(image_input)
-        self.show_zoom_dialog(pixmap, processed_pixmap, display_text)
+        self.show_zoom_dialog(pixmap, processed_pixmap, display_text, poster_id=tracking_id)
 
     def eventFilter(self, obj, event):
         """Track which poster button has keyboard focus."""
@@ -748,24 +788,20 @@ class OCRWorker(QThread):
         )
 
     def set_button_preview(self, btn, image_input):
-        """Update one gallery button to show the current preprocessed preview."""
-        preview_pixmap = self.make_processed_pixmap(image_input)
-
-        # Fallback to original if preprocessing failed for some reason.
-        if preview_pixmap.isNull():
-            if isinstance(image_input, str):
-                preview_pixmap = QPixmap(image_input)
-            else:
-                rgb_image = cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb_image.shape
-                q_img = QImage(
-                    rgb_image.data,
-                    w,
-                    h,
-                    ch * w,
-                    QImage.Format.Format_RGB888
-                )
-                preview_pixmap = QPixmap.fromImage(q_img.copy())
+        """Update one gallery button to show the original image thumbnail."""
+        if isinstance(image_input, str):
+            preview_pixmap = QPixmap(image_input)
+        else:
+            rgb_image = cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb_image.shape
+            q_img = QImage(
+                rgb_image.data,
+                w,
+                h,
+                ch * w,
+                QImage.Format.Format_RGB888
+            )
+            preview_pixmap = QPixmap.fromImage(q_img.copy())
 
         thumb_max = 220
         thumbnail = preview_pixmap.scaled(
@@ -779,12 +815,15 @@ class OCRWorker(QThread):
         btn.setIconSize(thumbnail.size())
         btn.setFixedSize(thumbnail.width() + 8, thumbnail.height() + 8)
 
-    def show_zoom_dialog(self, original_pixmap, processed_pixmap, text):
+    def show_zoom_dialog(self, original_pixmap, processed_pixmap, text, poster_id=None):
         """Opens a dialog with original and preprocessed poster views."""
         try:
             dialog = QDialog(self)
             dialog.setWindowTitle("Poster Viewer — Original vs Preprocessed")
             dialog.resize(1200, 700)
+
+            self.active_dialog = dialog
+            self.active_dialog_poster_id = poster_id
 
             main_layout = QVBoxLayout(dialog)
             image_layout = QHBoxLayout()
@@ -815,9 +854,15 @@ class OCRWorker(QThread):
             text_label.setMaximumHeight(100)
             text_label.setStyleSheet("padding: 8px; background-color: #1e1e1e; color: white;")
             main_layout.addWidget(text_label)
+            self.active_dialog_text_label = text_label
 
             right_view.setFocus()
             dialog.exec()
+            
+            # Clean up after dialog closes
+            self.active_dialog = None
+            self.active_dialog_poster_id = None
+            self.active_dialog_text_label = None
 
         except Exception as e:
             import traceback

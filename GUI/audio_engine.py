@@ -1,9 +1,8 @@
 import platform
-import queue
 import subprocess
 import threading
+import queue
 
-# Compatible with both windows/linux and macOS 
 class AudioEngine:
     def __init__(self):
         self._queue = queue.Queue()
@@ -12,49 +11,56 @@ class AudioEngine:
         self._thread.start()
 
     def speak(self, text):
-        """Queues text to be spoken. Non-blocking, safe to call from the GUI thread."""
+        """Queues text to be spoken. Interrupts any current speech immediately."""
         if not text:
             return
 
-        # Clear older queued speech so only the newest poster is read.
+        # Clear queue and stop current speech to ensure we handle "changing quickly"
         while not self._queue.empty():
             try:
                 self._queue.get_nowait()
             except queue.Empty:
                 break
-
-        # Stop current speech if possible.
+        
         self.stop()
-
         self._queue.put(text)
 
     def stop(self):
-        """Stops current speech if a subprocess is running."""
-        proc = self._current_process
-        if proc is not None and proc.poll() is None:
+        """Kills the current speech process immediately."""
+        if self._current_process and self._current_process.poll() is None:
             try:
-                proc.terminate()
+                self._current_process.terminate()
+                self._current_process.wait(timeout=0.5)
             except Exception:
-                pass
+                try:
+                    self._current_process.kill()
+                except:
+                    pass
+            self._current_process = None
 
     def _worker(self):
         while True:
             text = self._queue.get()
-
+            if text is None: break
+            
             try:
-                if platform.system() == "Darwin":
-                    # macOS: use built-in say command instead of pyttsx3/AppKit.
-                    self._current_process = subprocess.Popen(["say", text])
-                    self._current_process.wait()
-                    self._current_process = None
+                system = platform.system()
+                if system == "Darwin":
+                    # Mac
+                    cmd = ["say", text]
+                elif system == "Windows":
+                    # Windows PowerShell (no external library needed, handles interruption via process kill)
+                    clean_text = text.replace("'", "''")
+                    ps_cmd = f"Add-Type -AssemblyName System.Speech; (New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak('{clean_text}')"
+                    cmd = ["powershell", "-Command", ps_cmd]
                 else:
-                    # Fallback for Windows/Linux.
-                    import pyttsx3
-                    engine = pyttsx3.init()
-                    engine.setProperty("rate", 150)
-                    engine.say(text)
-                    engine.runAndWait()
-                    engine.stop()
+                    # Linux fallback
+                    cmd = ["spd-say", text]
 
+                self._current_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                self._current_process.wait()
             except Exception as e:
-                print(f"TTS Error: {e}") 
+                print(f"TTS Error: {e}")
+            finally:
+                self._current_process = None
+                self._queue.task_done()
