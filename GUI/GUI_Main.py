@@ -13,9 +13,9 @@ from audio_engine import AudioEngine
 from caption_engine import ImageCaptioner
 from ocr_engine import OCREngine
 
-# For quick debugging and testing of the results screen without needing to run the full video processing pipeline each time.
-LOAD_POSTERS_START_DIR = "/Users/macintosh/Library/CloudStorage/GoogleDrive-dsshakir@gmail.com/My Drive/CS591 Digital Image Processing/SAM/box_crops"
-LOAD_VIDEO_START_DIR = "/Users/macintosh/Library/CloudStorage/GoogleDrive-dsshakir@gmail.com/My Drive/CS591 Digital Image Processing/SAM"
+# For quick debugging and testing
+LOAD_POSTERS_START_DIR = ""
+LOAD_VIDEO_START_DIR = ""
 
 class ZoomableImageLabel(QLabel):
     """A QLabel that supports zoom (scroll wheel) and pan (click + drag)."""
