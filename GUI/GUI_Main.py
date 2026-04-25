@@ -28,7 +28,7 @@ class ZoomableImageLabel(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setMinimumSize(400, 400)
         self._update_display()
-
+ 
     def _update_display(self):
         scaled_w = int(self._original_pixmap.width() * self._zoom)
         scaled_h = int(self._original_pixmap.height() * self._zoom)
