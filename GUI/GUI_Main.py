@@ -1,3 +1,4 @@
+
 import sys
 
 import cv2
@@ -6,11 +7,15 @@ from PyQt6 import QtGui
 from PyQt6.QtCore import QTimer, Qt, QPoint
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QPainter, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QPushButton, QVBoxLayout, QHBoxLayout, \
-    QLabel, QWidget, QScrollArea, QGridLayout, QStackedWidget, QDialog
+    QLabel, QWidget, QScrollArea, QGridLayout, QStackedWidget, QDialog, QCheckBox, QComboBox
 
 from audio_engine import AudioEngine
 from caption_engine import ImageCaptioner
+from ocr_engine import OCREngine
 
+# For quick debugging and testing of the results screen without needing to run the full video processing pipeline each time.
+LOAD_POSTERS_START_DIR = "/Users/macintosh/Library/CloudStorage/GoogleDrive-dsshakir@gmail.com/My Drive/CS591 Digital Image Processing/SAM/box_crops"
+LOAD_VIDEO_START_DIR = "/Users/macintosh/Library/CloudStorage/GoogleDrive-dsshakir@gmail.com/My Drive/CS591 Digital Image Processing/SAM"
 
 class ZoomableImageLabel(QLabel):
     """A QLabel that supports zoom (scroll wheel) and pan (click + drag)."""
@@ -103,7 +108,7 @@ class VideoSourceManager:
 
     def select_file(self):
         """Opens a dialog to select a video file."""
-        file_path, _ = QFileDialog.getOpenFileName(None, "Select Video", "", "Video Files (*.mp4 *.avi *.mov)")
+        file_path, _ = QFileDialog.getOpenFileName(None, "Select Video", LOAD_VIDEO_START_DIR, "Video Files (*.mp4 *.avi *.mov)")
         if file_path:
             self.cap = cv2.VideoCapture(file_path)
             return self.cap, file_path
@@ -140,8 +145,8 @@ class PosterReaderApp(QWidget):
         self.timer.timeout.connect(self.process_frame)
 
         self.speaker = AudioEngine()
-
         self.captioner = ImageCaptioner()
+        self.ocr_engine = OCREngine()
 
     def init_menu_screen(self):
         page = QWidget()
@@ -223,9 +228,44 @@ class PosterReaderApp(QWidget):
         page = QWidget()
         layout = QVBoxLayout(page)
 
-        self.ocr_result_label = QLabel("Navigate posters with Arrow Keys. Press Enter to open. Press T to load test images.")
+        self.ocr_result_label = QLabel(
+            "Choose OCR preprocessing options, then press T to load test images. "
+            "Navigate posters with Arrow Keys. Press Enter to open."
+        )
         self.ocr_result_label.setWordWrap(True)
         layout.addWidget(self.ocr_result_label)
+
+        preprocess_layout = QHBoxLayout()
+
+        self.chk_grayscale = QCheckBox("Grayscale")
+        self.chk_threshold = QCheckBox("Adaptive Threshold")
+        self.chk_sharpen = QCheckBox("Sharpen")
+        self.chk_median = QCheckBox("Median Filter")
+
+        self.scale_combo = QComboBox()
+        self.scale_combo.addItem("0.5x", 0.5)
+        self.scale_combo.addItem("1x", 1.0)
+        self.scale_combo.addItem("2x", 2.0)
+        self.scale_combo.addItem("4x", 4.0)
+        self.scale_combo.setCurrentIndex(1)
+
+        self.chk_grayscale.stateChanged.connect(self.refresh_gallery_previews)
+        self.chk_threshold.stateChanged.connect(self.refresh_gallery_previews)
+        self.chk_sharpen.stateChanged.connect(self.refresh_gallery_previews)
+        self.chk_median.stateChanged.connect(self.refresh_gallery_previews)
+        self.scale_combo.currentIndexChanged.connect(self.refresh_gallery_previews)
+
+        preprocess_layout.addWidget(QLabel("OCR Preprocessing:"))
+        preprocess_layout.addWidget(self.chk_grayscale)
+        preprocess_layout.addWidget(self.chk_threshold)
+        preprocess_layout.addWidget(self.chk_sharpen)
+        preprocess_layout.addWidget(self.chk_median)
+        preprocess_layout.addWidget(QLabel("Scale:"))
+        preprocess_layout.addWidget(self.scale_combo)
+
+        layout.addLayout(preprocess_layout)
+
+
 
         scroll = QScrollArea()
         self.grid_widget = QWidget()
@@ -246,23 +286,39 @@ class PosterReaderApp(QWidget):
         self.stack.addWidget(page)
 
         QShortcut(QKeySequence("T"), self, activated=self.load_test_posters)
-
+        QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=lambda: self.move_poster_focus(1))
+        QShortcut(QKeySequence(Qt.Key.Key_Left), self, activated=lambda: self.move_poster_focus(-1))
+        QShortcut(QKeySequence(Qt.Key.Key_Down), self, activated=lambda: self.move_poster_focus(4))
+        QShortcut(QKeySequence(Qt.Key.Key_Up), self, activated=lambda: self.move_poster_focus(-4))
+        QShortcut(QKeySequence(Qt.Key.Key_Return), self, activated=self.open_focused_poster)
+        QShortcut(QKeySequence(Qt.Key.Key_Enter), self, activated=self.open_focused_poster)
         self.poster_buttons = []
         self.poster_data = []
         self.focused_poster_index = -1
+
+    def get_preprocess_options(self):
+        """Read OCR preprocessing options from the GUI controls."""
+        return {
+            "grayscale": self.chk_grayscale.isChecked(),
+            "threshold": self.chk_threshold.isChecked(),
+            "sharpen": self.chk_sharpen.isChecked(),
+            "median": self.chk_median.isChecked(),
+            "scale": self.scale_combo.currentData(),
+        }
 
     def load_test_posters(self):
         """Manually select images to test the gallery and OCR display."""
         if self.stack.currentIndex() != 2:
             return
-        files, _ = QFileDialog.getOpenFileNames(self, "Select Test Posters", "", "Images (*.png *.jpg *.jpeg)")
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Test Posters", LOAD_POSTERS_START_DIR, "Images (*.png *.jpg *.jpeg)")
+
+        preprocess_options = self.get_preprocess_options()
 
         for file_path in files:
-            # In the real pipeline, this text would come from the OCR engine
-            mock_ocr_text = f"OCR Output for {file_path.split('/')[-1]}: Sample Text Detected"
-            self.add_poster_to_gallery(file_path, mock_ocr_text)
+            detected_text, avg_conf = self.ocr_engine.get_text(file_path, preprocess_options)
+            self.add_poster_to_gallery(file_path, detected_text, avg_conf)
 
-    def add_poster_to_gallery(self, image_input, detected_text):
+    def add_poster_to_gallery(self, image_input, detected_text, avg_conf=None):
         """Adds a clickable thumbnail and handles rotation."""
         btn = QPushButton()
 
@@ -287,16 +343,7 @@ class PosterReaderApp(QWidget):
         short_description = self.captioner.generate_caption(pil_image)
         btn.setToolTip(f"Description: {short_description}")
 
-        thumb_max = 220
-        thumbnail = full_pixmap.scaled(
-            thumb_max, thumb_max,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-
-        btn.setIcon(QIcon(thumbnail))
-        btn.setIconSize(thumbnail.size())
-        btn.setFixedSize(thumbnail.width() + 8, thumbnail.height() + 8)
+        self.set_button_preview(btn, image_input)
 
         btn.setStyleSheet("""
                     QPushButton {
@@ -312,85 +359,223 @@ class PosterReaderApp(QWidget):
                 """)
 
         self.poster_buttons.append(btn)
-        self.poster_data.append((detected_text, full_pixmap, short_description))
 
-        def on_poster_click(text, pixmap):
-            self.ocr_result_label.setText(text)
+
+        if avg_conf is None:
+            confidence_text = "Average OCR confidence: N/A"
+        else:
+            confidence_text = f"Average OCR confidence: {avg_conf:.2%}"
+        
+        self.poster_data.append({
+            "image_input": image_input,
+            "detected_text": detected_text,
+            "pixmap": full_pixmap,
+            "description": short_description,
+            "confidence": confidence_text,
+        })
+
+        def on_poster_click(text, pixmap, confidence, image_input):
+            display_text = f"{text}\n\n{confidence}"
+            self.ocr_result_label.setText(display_text)
+
+            # Only read detected text aloud, not confidence.
             self.speaker.speak(text)
-            self.show_zoom_dialog(pixmap, text)
 
-        btn.clicked.connect(lambda checked, t=detected_text, p=full_pixmap: on_poster_click(t, p))
+            processed_pixmap = self.make_processed_pixmap(image_input)
+            self.show_zoom_dialog(pixmap, processed_pixmap, display_text)
+
+        btn.clicked.connect(
+            lambda checked=False, t=detected_text, p=full_pixmap, c=confidence_text, img=image_input:
+            on_poster_click(t, p, c, img)
+        )
         btn.installEventFilter(self)
 
         count = self.grid_layout.count()
         self.grid_layout.addWidget(btn, count // 4, count % 4)
 
-    def eventFilter(self, obj, event):
-        """When a poster button gains focus, show its description in the label."""
-        from PyQt6.QtCore import QEvent
-        if event.type() == QEvent.Type.FocusIn and obj in self.poster_buttons:
-            idx = self.poster_buttons.index(obj)
-            self.focused_poster_index = idx
-            detected_text, _, description = self.poster_data[idx]
-            self.ocr_result_label.setText(f"Description: {description}")
-        return super().eventFilter(obj, event)
+        if self.focused_poster_index == -1:
+            self.focused_poster_index = 0
+            self.poster_buttons[0].setFocus()
 
-    def keyPressEvent(self, event):
-        """Handle arrow key navigation and Enter to open poster in results screen."""
-        # Only handle when on the results screen (index 2)
-        if self.stack.currentIndex() != 2 or not self.poster_buttons:
-            super().keyPressEvent(event)
-            return
+    def make_processed_pixmap(self, image_input):
+        """Create a QPixmap showing the currently selected OCR preprocessing result."""
+        options = self.get_preprocess_options()
 
-        key = event.key()
-        cols = 4
-        idx = self.focused_poster_index
-
-        if key == Qt.Key.Key_Right:
-            idx = min(idx + 1, len(self.poster_buttons) - 1)
-        elif key == Qt.Key.Key_Left:
-            idx = max(idx - 1, 0)
-        elif key == Qt.Key.Key_Down:
-            idx = min(idx + cols, len(self.poster_buttons) - 1)
-        elif key == Qt.Key.Key_Up:
-            idx = max(idx - cols, 0)
-        elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
-            if 0 <= idx < len(self.poster_data):
-                text, pixmap, _ = self.poster_data[idx]
-                self.ocr_result_label.setText(text)
-                self.speaker.speak(text)
-                self.show_zoom_dialog(pixmap, text)
-            return
+        if isinstance(image_input, str):
+            frame = cv2.imread(image_input)
         else:
-            super().keyPressEvent(event)
+            frame = image_input.copy()
+
+        if frame is None:
+            return QPixmap()
+
+        processed = self.ocr_engine.preprocess_for_ocr(frame, options)
+
+        if len(processed.shape) == 2:
+            h, w = processed.shape
+            q_img = QImage(
+                processed.data,
+                w,
+                h,
+                w,
+                QImage.Format.Format_Grayscale8
+            )
+        else:
+            rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            q_img = QImage(
+                rgb.data,
+                w,
+                h,
+                ch * w,
+                QImage.Format.Format_RGB888
+            )
+
+        return QPixmap.fromImage(q_img.copy())
+
+
+
+    def move_poster_focus(self, delta):
+        """Move focus among poster thumbnails on the results screen."""
+        if self.stack.currentIndex() != 2 or not self.poster_buttons:
             return
+
+        if self.focused_poster_index < 0:
+            idx = 0
+        else:
+            idx = self.focused_poster_index + delta
+
+        idx = max(0, min(idx, len(self.poster_buttons) - 1))
 
         self.focused_poster_index = idx
         self.poster_buttons[idx].setFocus()
 
-    def show_zoom_dialog(self, pixmap, text):
-        """Opens a dialog with the full-resolution poster that supports zoom and pan."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Poster Viewer — +/- to zoom, Arrows to pan, 0 to reset, Esc to close")
-        dialog.resize(800, 700)
+        poster = self.poster_data[idx]
+        self.ocr_result_label.setText(f"Description: {poster['description']}")
 
-        layout = QVBoxLayout(dialog)
-        layout.setContentsMargins(0, 0, 0, 0)
 
-        zoom_label = ZoomableImageLabel(pixmap, dialog)
-        zoom_label.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        zoom_label.setSizePolicy(zoom_label.sizePolicy())
-        layout.addWidget(zoom_label, stretch=1)
+    def open_focused_poster(self):
+        """Open the currently focused poster and read only detected text aloud."""
+        if self.stack.currentIndex() != 2 or not self.poster_buttons:
+            return
 
-        # Text label at the bottom
-        text_label = QLabel(text)
-        text_label.setWordWrap(True)
-        text_label.setMaximumHeight(80)
-        text_label.setStyleSheet("padding: 8px; background-color: #1e1e1e; color: white;")
-        layout.addWidget(text_label)
-        zoom_label.setFocus()
+        if self.focused_poster_index < 0:
+            self.focused_poster_index = 0
+            self.poster_buttons[0].setFocus()
 
-        dialog.exec()
+        poster = self.poster_data[self.focused_poster_index]
+
+        text = poster["detected_text"]
+        pixmap = poster["pixmap"]
+        confidence = poster["confidence"]
+        image_input = poster["image_input"]
+
+        display_text = f"{text}\n\n{confidence}"
+
+        self.ocr_result_label.setText(display_text)
+        self.speaker.speak(text)
+
+        processed_pixmap = self.make_processed_pixmap(image_input)
+        self.show_zoom_dialog(pixmap, processed_pixmap, display_text)
+
+    def eventFilter(self, obj, event):
+        """Track which poster button has keyboard focus."""
+        from PyQt6.QtCore import QEvent
+
+        if event.type() == QEvent.Type.FocusIn and obj in self.poster_buttons:
+            self.focused_poster_index = self.poster_buttons.index(obj)
+
+        return super().eventFilter(obj, event)
+
+    def refresh_gallery_previews(self):
+        """Refresh all gallery thumbnails using the current preprocessing options."""
+        if not self.poster_buttons or not self.poster_data:
+            return
+
+        for btn, poster in zip(self.poster_buttons, self.poster_data):
+            self.set_button_preview(btn, poster["image_input"])
+
+        self.ocr_result_label.setText(
+            "Gallery previews updated with current preprocessing options. "
+            "Navigate posters with Arrow Keys. Press Enter to open."
+        )
+
+    def set_button_preview(self, btn, image_input):
+        """Update one gallery button to show the current preprocessed preview."""
+        preview_pixmap = self.make_processed_pixmap(image_input)
+
+        # Fallback to original if preprocessing failed for some reason.
+        if preview_pixmap.isNull():
+            if isinstance(image_input, str):
+                preview_pixmap = QPixmap(image_input)
+            else:
+                rgb_image = cv2.cvtColor(image_input, cv2.COLOR_BGR2RGB)
+                h, w, ch = rgb_image.shape
+                q_img = QImage(
+                    rgb_image.data,
+                    w,
+                    h,
+                    ch * w,
+                    QImage.Format.Format_RGB888
+                )
+                preview_pixmap = QPixmap.fromImage(q_img.copy())
+
+        thumb_max = 220
+        thumbnail = preview_pixmap.scaled(
+            thumb_max,
+            thumb_max,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation
+        )
+
+        btn.setIcon(QIcon(thumbnail))
+        btn.setIconSize(thumbnail.size())
+        btn.setFixedSize(thumbnail.width() + 8, thumbnail.height() + 8)
+
+    def show_zoom_dialog(self, original_pixmap, processed_pixmap, text):
+        """Opens a dialog with original and preprocessed poster views."""
+        try:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Poster Viewer — Original vs Preprocessed")
+            dialog.resize(1200, 700)
+
+            main_layout = QVBoxLayout(dialog)
+            image_layout = QHBoxLayout()
+            image_layout.setContentsMargins(0, 0, 0, 0)
+
+            left_layout = QVBoxLayout()
+            left_title = QLabel("Original")
+            left_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            left_view = ZoomableImageLabel(original_pixmap, dialog)
+            left_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            left_layout.addWidget(left_title)
+            left_layout.addWidget(left_view, stretch=1)
+
+            right_layout = QVBoxLayout()
+            right_title = QLabel("Preprocessed for OCR")
+            right_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            right_view = ZoomableImageLabel(processed_pixmap, dialog)
+            right_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            right_layout.addWidget(right_title)
+            right_layout.addWidget(right_view, stretch=1)
+
+            image_layout.addLayout(left_layout)
+            image_layout.addLayout(right_layout)
+            main_layout.addLayout(image_layout, stretch=1)
+
+            text_label = QLabel(text)
+            text_label.setWordWrap(True)
+            text_label.setMaximumHeight(100)
+            text_label.setStyleSheet("padding: 8px; background-color: #1e1e1e; color: white;")
+            main_layout.addWidget(text_label)
+
+            right_view.setFocus()
+            dialog.exec()
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "Zoom Viewer Error", str(e))
 
 
 if __name__ == '__main__':
