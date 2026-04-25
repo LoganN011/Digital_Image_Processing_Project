@@ -6,9 +6,15 @@ import numpy as np
 
 
 
+import torch
+
 class OCREngine:
     def __init__(self):
-        self.reader = easyocr.Reader(['en'])
+        # Determine device: CUDA for Windows/Linux with NVIDIA, CPU for others.
+        # EasyOCR doesn't fully support MPS (Mac Metal) yet, so we default to CPU on Mac 
+        # unless CUDA is somehow present (not likely on modern Macs).
+        use_gpu = torch.cuda.is_available()
+        self.reader = easyocr.Reader(['en'], gpu=use_gpu)
 
     def get_text(self, image_input, preprocess_options=None):
         """
