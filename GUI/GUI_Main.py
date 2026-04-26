@@ -423,7 +423,7 @@ class PosterReaderApp(QWidget):
         layout = QVBoxLayout(page)
 
         self.ocr_result_label = QLabel(
-            "Choose OCR preprocessing options, then press T to load test images. "
+            "Choose OCR preprocessing options, then press T to load local images. "
             "Navigate posters with Arrow Keys. Press Enter to open."
         )
         self.ocr_result_label.setWordWrap(True)
@@ -471,8 +471,7 @@ class PosterReaderApp(QWidget):
 
         layout.addWidget(scroll)
 
-        # ADDED FOR TESTING: A button to manually load test images
-        btn_test = QPushButton("Test OCR: Load Local Images  [T]")
+        btn_test = QPushButton("Load Local Images  [T]")
         btn_test.clicked.connect(self.load_test_posters)
         layout.addWidget(btn_test)
 
@@ -523,7 +522,7 @@ class PosterReaderApp(QWidget):
         """Manually select images to test the gallery and OCR display."""
         if self.stack.currentIndex() != 2:
             return
-        files, _ = QFileDialog.getOpenFileNames(self, "Select Test Posters", LOAD_POSTERS_START_DIR, "Images (*.png *.jpg *.jpeg)")
+        files, _ = QFileDialog.getOpenFileNames(self, "Select Posters", LOAD_POSTERS_START_DIR, "Images (*.png *.jpg *.jpeg)")
 
         preprocess_options = self.get_preprocess_options()
 
