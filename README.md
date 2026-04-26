@@ -50,9 +50,24 @@ SAM3 weights are gated on Hugging Face. To use SAM3:
    ```
    Or set the `HF_TOKEN` environment variable on your system.
 
+# Accessibility & Screen Reader
+
+The application includes a built-in **Screen Reader** for visually impaired users. When enabled:
+- **Voice Guidance**: All focused elements (buttons, checkboxes, gallery items) are narrated aloud.
+- **AI Descriptions**: Narrates visual descriptions of posters and detected text.
+- **Contextual Alerts**: Announces screen transitions and dialog states.
+
+**Toggle**: Use the checkbox at the bottom of the window or the keyboard shortcut.
+
 # Keyboard Shortcuts
 
 The GUI is fully navigable without a mouse.
+
+### Global Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Ctrl + Alt + S` | **Toggle Screen Reader** on/off |
 
 ### Menu Screen
 
@@ -85,6 +100,7 @@ When a poster is focused via keyboard, its AI-generated description is shown at 
 
 | Key | Action |
 |-----|--------|
+| `R` | **Read OCR Text aloud** |
 | `+` / `=` | Zoom in |
 | `-` | Zoom out |
 | `←` `→` `↑` `↓` | Pan the image |

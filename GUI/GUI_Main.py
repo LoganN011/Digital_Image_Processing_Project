@@ -6,8 +6,7 @@ import cv2
 from PIL import Image
 import threading
 
-from PyQt6 import QtGui
-from PyQt6.QtCore import QTimer, Qt, QPoint
+from PyQt6.QtCore import QTimer, Qt, QPoint, pyqtSignal, QThread
 from PyQt6.QtGui import QPixmap, QImage, QIcon, QPainter, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QFileDialog, QMessageBox, QApplication, QPushButton, QVBoxLayout, QHBoxLayout, \
     QLabel, QWidget, QScrollArea, QGridLayout, QStackedWidget, QDialog, QCheckBox, QComboBox, QProgressBar
@@ -17,6 +16,7 @@ from caption_engine import ImageCaptioner
 from ocr_engine import OCREngine
 from sam_engine import SAMWorker
 from dino_engine import DINOWorker
+from screen_reader import ScreenReaderFilter
 
 # For quick debugging and testing
 LOAD_POSTERS_START_DIR = ""
@@ -24,8 +24,9 @@ LOAD_VIDEO_START_DIR = ""
 
 class ZoomableImageLabel(QLabel):
     """A QLabel that supports zoom (scroll wheel) and pan (click + drag)."""
-    def __init__(self, pixmap, parent=None):
+    def __init__(self, pixmap, name="Image view", parent=None):
         super().__init__(parent)
+        self.accessible_name = name
         self._original_pixmap = pixmap
         self._zoom = 1.0
         self._pan_offset = QPoint(0, 0)
@@ -128,8 +129,6 @@ class VideoSourceManager:
         return self.cap
 
 
-from PyQt6.QtCore import QObject, pyqtSignal, QThread, QTimer, Qt, QPoint
-
 class CaptionWorker(QThread):
     caption_ready = pyqtSignal(object, str)
 
@@ -214,15 +213,19 @@ class PosterReaderApp(QWidget):
         super().__init__()
         self.manager = VideoSourceManager()
         self.current_cap = None
-        self.found_posters = []
         self.is_live_camera = False
         self.video_path = None
         self.temp_video_writer = None
+        self.next_poster_id = 0
 
         self.setWindowTitle("UNM Poster Reader")
         self.resize(1000, 700)
 
+        self.speaker = AudioEngine()
+        self.screen_reader_enabled = True # Default to True
+
         self.stack = QStackedWidget()
+        self.stack.currentChanged.connect(self.on_screen_changed)
         self.init_menu_screen()
         self.init_processing_screen()
         self.init_results_screen()
@@ -230,10 +233,19 @@ class PosterReaderApp(QWidget):
         layout = QVBoxLayout(self)
         layout.addWidget(self.stack)
 
+        # Global Screen Reader Toggle
+        self.chk_screen_reader = QCheckBox("Enable Screen Reader  [Ctrl+Alt+S]")
+        self.chk_screen_reader.setChecked(self.screen_reader_enabled)
+        self.chk_screen_reader.toggled.connect(self.toggle_screen_reader)
+        layout.addWidget(self.chk_screen_reader)
+
+        # Keyboard Shortcut for Toggle
+        self.toggle_shortcut = QShortcut(QKeySequence("Ctrl+Alt+S"), self)
+        self.toggle_shortcut.activated.connect(lambda: self.chk_screen_reader.toggle())
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.process_frame)
 
-        self.speaker = AudioEngine()
         self.captioner = ImageCaptioner()
         self.ocr_engine = OCREngine()
         self.poster_id_to_button = {}
@@ -243,9 +255,15 @@ class PosterReaderApp(QWidget):
         self.caption_worker.caption_ready.connect(self.on_caption_ready)
         self.caption_worker.start()
 
+        self.reader_filter = ScreenReaderFilter(self)
+        QApplication.instance().installEventFilter(self.reader_filter)
+
         self.ocr_worker = OCRWorker(self.ocr_engine)
         self.ocr_worker.ocr_ready.connect(self.on_ocr_ready)
         self.ocr_worker.start()
+
+        # Initial screen summary
+        QTimer.singleShot(1500, lambda: self.read_screen_controls(0))
 
     def init_menu_screen(self):
         page = QWidget()
@@ -263,6 +281,35 @@ class PosterReaderApp(QWidget):
 
         QShortcut(QKeySequence("1"), self, activated=self.run_file_input)
         QShortcut(QKeySequence("2"), self, activated=self.run_camera_input)
+
+    def toggle_screen_reader(self, checked):
+        self.screen_reader_enabled = checked
+        status = "Screen reader enabled" if checked else "Screen reader disabled"
+        if checked:
+            self.speaker.speak(status)
+        else:
+            self.speaker.stop()
+
+    def on_screen_changed(self, index):
+        if not self.screen_reader_enabled:
+            return
+        
+        screens = ["Main Menu", "Processing Posters", "Poster Gallery"]
+        if 0 <= index < len(screens):
+            name = screens[index]
+            self.speaker.speak(f"Screen: {name}")
+            
+            # Briefly list buttons on the new screen
+            QTimer.singleShot(1000, lambda: self.read_screen_controls(index))
+
+    def read_screen_controls(self, index):
+        if not self.screen_reader_enabled: return
+        
+        page = self.stack.widget(index)
+        controls = page.findChildren(QPushButton) + page.findChildren(QCheckBox)
+        if controls:
+            names = ", ".join([c.text().split("[")[0].strip() for c in controls if c.isVisible()])
+            self.speaker.speak(f"Actions available: {names}")
 
     def run_file_input(self):
         if self.stack.currentIndex() != 0:
@@ -351,14 +398,16 @@ class PosterReaderApp(QWidget):
         self.poster_buttons = []
         self.poster_data = []
         self.focused_poster_index = -1
+        self.next_poster_id = 0
 
         # Switch to results screen immediately
         self.stack.setCurrentIndex(2)
         self.results_progress_bar.setVisible(True)
         self.results_status_label.setVisible(True)
         self.btn_stop_proc.setVisible(True)
-        self.results_progress_bar.setValue(0)
         self.results_status_label.setText("Starting model processing...")
+        if self.screen_reader_enabled:
+            self.speaker.speak("Starting model processing...")
 
         # --- MODEL SELECTION ---
         # Uncomment the model you wish to use:
@@ -408,7 +457,10 @@ class PosterReaderApp(QWidget):
     def on_model_finished(self, results, output_path=None):
         self.results_progress_bar.setVisible(False)
         self.btn_stop_proc.setVisible(False)
-        self.results_status_label.setText(f"Processing complete. Found {len(self.poster_data)} posters.")
+        msg = f"Processing complete. Found {len(self.poster_data)} posters."
+        self.results_status_label.setText(msg)
+        if self.screen_reader_enabled:
+            self.speaker.speak(msg)
 
     def stop_model_processing(self):
         """Stops the current vision engine worker early."""
@@ -527,8 +579,10 @@ class PosterReaderApp(QWidget):
         preprocess_options = self.get_preprocess_options()
 
         for file_path in files:
+            pid = self.next_poster_id
+            self.next_poster_id += 1
             detected_text, avg_conf = self.ocr_engine.get_text(file_path, preprocess_options)
-            self.add_poster_to_gallery(file_path, detected_text, avg_conf)
+            self.add_poster_to_gallery(file_path, detected_text, avg_conf, poster_id=pid)
 
     def add_poster_to_gallery(self, image_input, detected_text, avg_conf=None, poster_id=None):
         """Adds a clickable thumbnail and handles rotation."""
@@ -548,8 +602,13 @@ class PosterReaderApp(QWidget):
 
             pil_image = Image.fromarray(rgb_image)
             
+        # Always ensure we have a unique ID for indexing
+        if poster_id is None:
+            poster_id = self.next_poster_id
+            self.next_poster_id += 1
+            
         # Queue background captioning
-        self.caption_worker.add_task(poster_id if poster_id is not None else len(self.poster_buttons)-1, pil_image)
+        self.caption_worker.add_task(poster_id, pil_image)
         btn.setToolTip("Generating description...")
 
         self.set_button_preview(btn, image_input)
@@ -587,10 +646,9 @@ class PosterReaderApp(QWidget):
         btn.clicked.connect(lambda: self.on_poster_click(btn))
         btn.installEventFilter(self)
 
-        if poster_id is not None:
-            self.poster_id_to_button[poster_id] = btn
+        self.poster_id_to_button[poster_id] = btn
 
-        count = self.grid_layout.count()
+        count = len(self.poster_buttons) - 1
         self.grid_layout.addWidget(btn, count // 4, count % 4)
 
         if self.focused_poster_index == -1:
@@ -623,6 +681,8 @@ class PosterReaderApp(QWidget):
             self.poster_data[idx]["description"] = description
             if self.focused_poster_index == idx:
                 self.ocr_result_label.setText(f"Description: {description}")
+                if self.screen_reader_enabled:
+                    self.speaker.speak(f"Description ready: {description}")
 
     def on_ocr_ready(self, poster_id, text, confidence):
         """Updates the gallery data once OCR is done."""
@@ -759,10 +819,12 @@ class PosterReaderApp(QWidget):
         display_text = f"{text}\n\n{confidence}"
         desc = poster.get("description", "Generating description...")
         self.ocr_result_label.setText(f"Description: {desc}")
-        self.speaker.speak(text)
+        
+        # Prepare OCR text for the dialog to handle
+        ocr_text = text
 
         processed_pixmap = self.make_processed_pixmap(image_input)
-        self.show_zoom_dialog(pixmap, processed_pixmap, display_text, poster_id=tracking_id)
+        self.show_zoom_dialog(pixmap, processed_pixmap, display_text, ocr_text=ocr_text, poster_id=tracking_id)
 
     def eventFilter(self, obj, event):
         """Track which poster button has keyboard focus."""
@@ -814,7 +876,7 @@ class PosterReaderApp(QWidget):
         btn.setIconSize(thumbnail.size())
         btn.setFixedSize(thumbnail.width() + 8, thumbnail.height() + 8)
 
-    def show_zoom_dialog(self, original_pixmap, processed_pixmap, text, poster_id=None):
+    def show_zoom_dialog(self, original_pixmap, processed_pixmap, text, ocr_text=None, poster_id=None):
         """Opens a dialog with original and preprocessed poster views."""
         try:
             dialog = QDialog(self)
@@ -831,7 +893,7 @@ class PosterReaderApp(QWidget):
             left_layout = QVBoxLayout()
             left_title = QLabel("Original")
             left_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            left_view = ZoomableImageLabel(original_pixmap, dialog)
+            left_view = ZoomableImageLabel(original_pixmap, "Original View", dialog)
             left_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             left_layout.addWidget(left_title)
             left_layout.addWidget(left_view, stretch=1)
@@ -839,7 +901,7 @@ class PosterReaderApp(QWidget):
             right_layout = QVBoxLayout()
             right_title = QLabel("Preprocessed for OCR")
             right_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            right_view = ZoomableImageLabel(processed_pixmap, dialog)
+            right_view = ZoomableImageLabel(processed_pixmap, "Preprocessed View", dialog)
             right_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             right_layout.addWidget(right_title)
             right_layout.addWidget(right_view, stretch=1)
@@ -855,7 +917,21 @@ class PosterReaderApp(QWidget):
             main_layout.addWidget(text_label)
             self.active_dialog_text_label = text_label
 
+            # Add a button to re-read OCR text
+            btn_reread = QPushButton("Read Text  [R]")
+            btn_reread.clicked.connect(lambda: self.speaker.speak(ocr_text))
+            main_layout.addWidget(btn_reread)
+            
+            QShortcut(QKeySequence("R"), dialog, activated=lambda: self.speaker.speak(ocr_text))
+
+            self.reader_filter.suppress_once = True
             right_view.setFocus()
+            
+            # Final OCR narration call - slightly delayed to ensure UI is ready
+            if self.screen_reader_enabled and ocr_text:
+                # Ensure the text is fully read by giving it priority
+                QTimer.singleShot(400, lambda: self.speaker.speak(ocr_text))
+
             dialog.exec()
             
             # Clean up after dialog closes
