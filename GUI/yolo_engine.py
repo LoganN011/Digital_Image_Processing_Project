@@ -43,11 +43,6 @@ def resolve_local_path(path: str | Path) -> str:
     p = Path(path)
     return str(p if p.is_absolute() else SCRIPT_DIR / p)
 
-# Kept for compatibility with older imports, but no longer used as the primary
-# object identity mechanism.
-CENTROID_THRESHOLD = 250
-
-
 @dataclass
 class TrackBox:
     xyxy: list[int]
@@ -140,10 +135,6 @@ def bbox_iou(b1: list[list[int]] | list[int], b2: list[list[int]] | list[int]) -
     return inter / union if union > 0 else 0.0
 
 
-# -----------------------------------------------------------------------------
-# v11-style box/crop helpers
-# -----------------------------------------------------------------------------
-
 def clamp_box(box: Iterable[float], frame_shape: tuple[int, ...]) -> list[int] | None:
     h, w = frame_shape[:2]
     x1, y1, x2, y2 = box
@@ -231,8 +222,8 @@ def pad_bbox(bbox: list[list[int]] | list[int], frame_shape: tuple[int, ...], pa
 
 class YOLOEngine(QObject):
     progress = pyqtSignal(int, str)
-    finished = pyqtSignal(list)            # list[np.ndarray] best crops, old interface
-    poster_found = pyqtSignal(int, object) # object_id, crop, old interface
+    finished = pyqtSignal(list)           
+    poster_found = pyqtSignal(int, object)
     error = pyqtSignal(str)
 
     poster_found_record = pyqtSignal(dict)
@@ -505,7 +496,7 @@ class YOLOEngine(QObject):
   
                 continue
             else:
-                # optionalfallback, disabled by default.
+  
                 track_id = self._fallback_id_next
                 self._fallback_id_next += 1
 
@@ -580,9 +571,7 @@ class YOLOEngine(QObject):
 
     def _emit_record_update(self, rec: CropRecord):
         summary = rec.to_summary(include_crop=True)
-        # Old interface: crop only.
         self.poster_found.emit(int(rec.object_id), rec.best_crop.copy())
-        # New richer interface for GUI panels / OCR queues.
         self.poster_found_record.emit(summary)
 
     def get_crop_records(self, include_crop: bool = True, only_ready: bool = False) -> list[dict[str, Any]]:

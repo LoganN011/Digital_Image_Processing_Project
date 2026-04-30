@@ -79,7 +79,7 @@ def preprocess_for_ocr(crop_bgr: np.ndarray) -> np.ndarray:
     clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8))
     gray = clahe.apply(gray)
 
-    # mild unsharp mask
+    # unsharp mask
     blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
     return cv2.addWeighted(gray, 1.45, blur, -0.45, 0)
 
@@ -150,7 +150,6 @@ def crop_easyocr_text_region(image: np.ndarray, pts: Any, pad: int = 3) -> np.nd
     if pad > 0:
         crop = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
 
-    # PARSeq best when very small text lines are enlarged before transform
     h, _w = crop.shape[:2]
     if h < 32:
         scale = min(4.0, 32.0 / max(1, h))
@@ -167,7 +166,7 @@ class OCREngine:
         verbose: bool = False,
         parseq_repo: str = DEFAULT_PARSEQ_REPO,
         parseq_model_name: str = DEFAULT_PARSEQ_MODEL,
-        lazy_load: bool = True,
+        lazy_load: bool = False,
     ):
         self.languages = list(languages or ["en"])
         self.gpu = bool(gpu)
@@ -194,35 +193,50 @@ class OCREngine:
         return result.text, result.avg_conf
 
     def get_text_details(self, image_input, options: dict[str, Any] | None = None) -> OCRResult:
+        progress_callback = None
         try:
+            options = dict(options or {})
+            progress_callback = options.get("progress_callback")
+            self._emit_progress(progress_callback, "Reading image", 3, stage="read_image")
+
             frame = self._read_image(image_input)
             if frame is None or frame.size == 0:
+                self._emit_progress(progress_callback, "OCR error: image not found", 100, stage="error")
                 return OCRResult("OCR Error: Image not found or empty.", 0.0, "error", [])
 
+            self._emit_progress(progress_callback, "Loading OCR models", 8, stage="loading_models")
             if not self.load_models_if_needed():
                 msg = self.reader_error or self.parseq_error or "OCR models failed to load"
+                self._emit_progress(progress_callback, f"OCR unavailable: {msg}", 100, stage="error")
                 return OCRResult(f"OCR unavailable: {msg}", 0.0, "error", [])
 
-            options = dict(options or {})
             joiner = str(options.get("joiner", DEFAULT_JOINER))
             retry_invert = bool(options.get("retry_invert", DEFAULT_RETRY_INVERT_IF_BLANK))
 
+            self._emit_progress(progress_callback, "Preprocessing crop", 15, stage="preprocess")
             ocr_img = preprocess_for_ocr(frame)
+
+            self._emit_progress(progress_callback, "EasyOCR readtext: detecting lines", 25, stage="easyocr_readtext")
             raw = self.run_easyocr_readtext(ocr_img)
-            lines = self.extract_parseq_second_pass_text(raw, ocr_img)
+            total = len(raw) if raw else 0
+            self._emit_progress(progress_callback, f"PARSeq second pass: 0/{total} lines", 35 if total else 45, stage="parseq", done=0, total=total)
+            lines = self.extract_parseq_second_pass_text(raw, ocr_img, progress_callback=progress_callback)
             used_inverted = False
 
-            # Second try: invert colors
             if retry_invert and not lines:
+                self._emit_progress(progress_callback, "Retrying OCR with inverted contrast", 70, stage="invert_retry")
                 inv = cv2.bitwise_not(ocr_img)
                 raw2 = self.run_easyocr_readtext(inv)
-                lines2 = self.extract_parseq_second_pass_text(raw2, inv)
+                total2 = len(raw2) if raw2 else 0
+                self._emit_progress(progress_callback, f"PARSeq inverted pass: 0/{total2} lines", 75 if total2 else 85, stage="parseq_invert", done=0, total=total2)
+                lines2 = self.extract_parseq_second_pass_text(raw2, inv, progress_callback=progress_callback, progress_start=75, progress_end=95, stage="parseq_invert")
                 if lines2:
                     raw = raw2
                     lines = lines2
                     used_inverted = True
 
             if not lines:
+                self._emit_progress(progress_callback, "OCR done: no text", 100, stage="done", done=0, total=len(raw))
                 return OCRResult("(no text)", 0.0, "PARSeq+EasyOCR.readtext", [], used_inverted, raw_count=len(raw))
 
             text = joiner.join(line.text for line in lines)
@@ -231,10 +245,22 @@ class OCREngine:
             if used_inverted:
                 method += "+invert"
 
+            self._emit_progress(progress_callback, f"OCR done: {len(lines)} line(s)", 100, stage="done", done=len(lines), total=len(raw))
             return OCRResult(text, avg_conf, method, lines, used_inverted, raw_count=len(raw))
 
         except Exception as exc:
+            self._emit_progress(progress_callback, f"OCR error: {exc}", 100, stage="error")
             return OCRResult(f"OCR Error: {exc}", 0.0, "error", [])
+
+    def _emit_progress(self, callback, message: str, percent: int, **extra):
+        if callback is None:
+            return
+        try:
+            info = {"message": str(message), "percent": int(max(0, min(100, percent)))}
+            info.update(extra)
+            callback(info)
+        except Exception:
+            pass
 
     def load_models_if_needed(self) -> bool:
         return self.load_easyocr_if_needed() and self.load_parseq_if_needed()
@@ -262,7 +288,7 @@ class OCREngine:
         self.parseq_load_attempted = True
         try:
             import torch
-            from PIL import Image  # noqa: F401 - verify Pillow is available
+            from PIL import Image 
 
             self.torch = torch
             if torch.cuda.is_available():
@@ -330,11 +356,29 @@ class OCREngine:
             add_margin=0.12,
         )
 
-    def extract_parseq_second_pass_text(self, raw: list[Any], ocr_img: np.ndarray) -> list[OCRLine]:
+    def extract_parseq_second_pass_text(
+        self,
+        raw: list[Any],
+        ocr_img: np.ndarray,
+        progress_callback=None,
+        progress_start: int = 35,
+        progress_end: int = 95,
+        stage: str = "parseq",
+    ) -> list[OCRLine]:
         """Use PARSeq to re-recognize EasyOCR-detected crops; EasyOCR text is fallback."""
         lines: list[OCRLine] = []
+        ordered = sort_easyocr_results(raw)
+        total = len(ordered)
 
-        for item in sort_easyocr_results(raw):
+        if total == 0:
+            self._emit_progress(progress_callback, "No EasyOCR text boxes found", progress_end, stage=stage, done=0, total=0)
+            return lines
+
+        span = max(1, int(progress_end) - int(progress_start))
+        for idx, item in enumerate(ordered, start=1):
+            pct = int(progress_start + span * (idx - 1) / max(1, total))
+            self._emit_progress(progress_callback, f"PARSeq line {idx}/{total}", pct, stage=stage, done=idx - 1, total=total, line=idx)
+
             if len(item) < 3:
                 continue
 
@@ -377,6 +421,9 @@ class OCREngine:
                         easyocr_conf=float(easy_conf),
                     )
                 )
+
+            pct = int(progress_start + span * idx / max(1, total))
+            self._emit_progress(progress_callback, f"PARSeq line {idx}/{total}", pct, stage=stage, done=idx, total=total, line=idx)
 
         return lines
 
