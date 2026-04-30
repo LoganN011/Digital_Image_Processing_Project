@@ -1,3 +1,11 @@
+# UNM CS591 Digital Image Processing Final Project
+# Poster Reader GUI
+
+from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
 import sys
 import queue
 
@@ -37,14 +45,18 @@ try:
 except ImportError:
     DINOWorker = None
 
+try:
+    from yolo_engine import YOLOWorker
+except ImportError:
+    YOLOWorker = None
 
 # For quick debugging and testing.
-LOAD_POSTERS_START_DIR = ""
-LOAD_VIDEO_START_DIR = ""
+LOAD_POSTERS_START_DIR = Path(__file__).resolve().parent    
+LOAD_VIDEO_START_DIR = Path(__file__).resolve().parent
 
 # Choose which detector worker to use for full video processing.
-# Valid values: "dino" or "sam".
-MODEL_BACKEND = "dino"
+# Valid values: "dino" or "sam" or "yolo".
+MODEL_BACKEND = "yolo"
 
 GALLERY_CARD_WIDTH = 230
 GALLERY_COLS = 4
@@ -149,7 +161,7 @@ class VideoSourceManager:
         file_path, _ = QFileDialog.getOpenFileName(
             None,
             "Select Video",
-            LOAD_VIDEO_START_DIR,
+            str(LOAD_VIDEO_START_DIR),
             "Video Files (*.mp4 *.avi *.mov)",
         )
         if file_path:
@@ -288,15 +300,17 @@ class PosterReaderApp(QWidget):
         btn_file = QPushButton("Select Video File  [1]")
         btn_file.clicked.connect(self.run_file_input)
 
-        btn_cam = QPushButton("Start Live Record  [2]")
-        btn_cam.clicked.connect(self.run_camera_input)
+        # btn_cam = QPushButton("Start Live Record  [2]")
+        # btn_cam.clicked.connect(self.run_camera_input)
 
         layout.addWidget(btn_file)
-        layout.addWidget(btn_cam)
+        # layout.addWidget(btn_cam)
         self.stack.addWidget(page)
 
-        QShortcut(QKeySequence("1"), self, activated=self.run_file_input)
-        QShortcut(QKeySequence("2"), self, activated=self.run_camera_input)
+        shortcut1 = QShortcut(QKeySequence("1"), self)
+        shortcut1.activated.connect(self.run_file_input)
+        # shortcut2 = QShortcut(QKeySequence("2"), self)
+        # shortcut2.activated.connect(self.run_camera_input)
 
     def run_file_input(self):
         if self.stack.currentIndex() != 0:
@@ -308,24 +322,24 @@ class PosterReaderApp(QWidget):
             self.video_path = path
             self.start_pipeline()
 
-    def run_camera_input(self):
-        if self.stack.currentIndex() != 0:
-            return
-        cap = self.manager.start_camera()
-        if cap:
-            self.current_cap = cap
-            self.is_live_camera = True
-            self.video_path = "temp_record.mp4"
+    # def run_camera_input(self):
+    #     if self.stack.currentIndex() != 0:
+    #         return
+    #     cap = self.manager.start_camera()
+    #     if cap:
+    #         self.current_cap = cap
+    #         self.is_live_camera = True
+    #         self.video_path = "temp_record.mp4"
 
-            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            self.temp_video_writer = cv2.VideoWriter(
-                self.video_path, fourcc, fps, (width, height)
-            )
+    #         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    #         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    #         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    #         fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+    #         self.temp_video_writer = cv2.VideoWriter(
+    #             self.video_path, fourcc, fps, (width, height)
+    #         )
 
-            self.start_pipeline()
+    #         self.start_pipeline()
 
     def start_pipeline(self):
         self.stack.setCurrentIndex(1)
@@ -344,8 +358,8 @@ class PosterReaderApp(QWidget):
         self.proc_layout.addWidget(btn_stop)
         self.stack.addWidget(page)
 
-        QShortcut(QKeySequence("Space"), self, activated=self.stop_processing)
-        QShortcut(QKeySequence("Escape"), self, activated=self.stop_processing)
+        QShortcut(QKeySequence("Space"), self).activated.connect(self.stop_processing)
+        QShortcut(QKeySequence("Escape"), self).activated.connect(self.stop_processing)
 
     def process_frame(self):
         ret, frame = self.current_cap.read()
@@ -457,14 +471,22 @@ class PosterReaderApp(QWidget):
         page.setLayout(layout)
         self.stack.addWidget(page)
 
-        QShortcut(QKeySequence("T"), self, activated=self.load_test_posters)
-        QShortcut(QKeySequence("X"), self, activated=self.stop_model_processing)
-        QShortcut(QKeySequence(Qt.Key.Key_Right), self, activated=lambda: self.move_poster_focus(1))
-        QShortcut(QKeySequence(Qt.Key.Key_Left), self, activated=lambda: self.move_poster_focus(-1))
-        QShortcut(QKeySequence(Qt.Key.Key_Down), self, activated=lambda: self.move_poster_focus(4))
-        QShortcut(QKeySequence(Qt.Key.Key_Up), self, activated=lambda: self.move_poster_focus(-4))
-        QShortcut(QKeySequence(Qt.Key.Key_Return), self, activated=self.open_focused_poster)
-        QShortcut(QKeySequence(Qt.Key.Key_Enter), self, activated=self.open_focused_poster)
+        sc = QShortcut(QKeySequence("T"), self)
+        sc.activated.connect(self.load_test_posters)
+        sc = QShortcut(QKeySequence("X"), self)
+        sc.activated.connect(self.stop_model_processing)
+        sc = QShortcut(QKeySequence(Qt.Key.Key_Right), self)
+        sc.activated.connect(lambda: self.move_poster_focus(1))
+        sc = QShortcut(QKeySequence(Qt.Key.Key_Left), self)
+        sc.activated.connect(lambda: self.move_poster_focus(-1))
+        sc = QShortcut(QKeySequence(Qt.Key.Key_Down), self)
+        sc.activated.connect(lambda: self.move_poster_focus(4))
+        sc = QShortcut(QKeySequence(Qt.Key.Key_Up), self)
+        sc.activated.connect(lambda: self.move_poster_focus(-4))
+        sc = QShortcut(QKeySequence(Qt.Key.Key_Return), self)
+        sc.activated.connect(self.open_focused_poster)
+        sc = QShortcut(QKeySequence(Qt.Key.Key_Enter), self)
+        sc.activated.connect(self.open_focused_poster)
 
         self.poster_buttons = []
         self.poster_data = []
@@ -501,9 +523,16 @@ class PosterReaderApp(QWidget):
         if MODEL_BACKEND.lower() == "sam":
             worker_cls = SAMWorker
             backend_name = "SAM"
-        else:
+        elif MODEL_BACKEND.lower() == "dino":
             worker_cls = DINOWorker
             backend_name = "DINO"
+        elif MODEL_BACKEND.lower() == "yolo":
+            worker_cls = YOLOWorker
+            backend_name = "YOLO"
+        else:
+            worker_cls = None
+            backend_name = MODEL_BACKEND.upper()
+  
 
         if worker_cls is None:
             self.on_error(
@@ -520,7 +549,7 @@ class PosterReaderApp(QWidget):
 
     def stop_model_processing(self):
         """Requests the current vision engine worker to stop without freezing the GUI."""
-        if hasattr(self, "model_worker") and self.model_worker.isRunning():
+        if hasattr(self, "model_worker") and self.model_worker is not None and self.model_worker.isRunning():
             self.results_status_label.setText("Stopping after current frame...")
             self.btn_stop_proc.setEnabled(False)
 
@@ -593,7 +622,7 @@ class PosterReaderApp(QWidget):
         files, _ = QFileDialog.getOpenFileNames(
             self,
             "Select Test Posters",
-            LOAD_POSTERS_START_DIR,
+            str(LOAD_POSTERS_START_DIR),
             "Images (*.png *.jpg *.jpeg)",
         )
         if not files:
@@ -613,16 +642,6 @@ class PosterReaderApp(QWidget):
             print("Add/caption seconds:", time.time() - t1)
 
             QApplication.processEvents()
-
-        # for file_path in files:
-        #     detected_text, avg_conf = self.ocr_engine.get_text(file_path, preprocess_options)
-        #     self.add_poster_to_gallery(
-        #         file_path,
-        #         detected_text,
-        #         avg_conf,
-        #         poster_id=None,
-        #         run_caption_async=True,
-        #     )
 
     def add_poster_to_gallery(
         self,
