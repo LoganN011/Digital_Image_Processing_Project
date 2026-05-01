@@ -84,6 +84,21 @@ def crop_quality(frame: np.ndarray, box: list[int], detector_score: float) -> fl
     return 0.42 * float(detector_score) + 0.33 * sharp_score + 0.18 * area_score + 0.07 * aspect_score - edge_penalty
 
 
+def detector_preview(frame: np.ndarray, boxes: list["TrackBox"], long_side: int = 480) -> np.ndarray:
+    preview = frame.copy()
+    for box in boxes:
+        x1, y1, x2, y2 = box.xyxy
+        cv2.rectangle(preview, (x1, y1), (x2, y2), (0, 255, 0), 3)
+        label = f"ID {box.track_id} {box.score:.2f}"
+        cv2.putText(preview, label, (x1, max(18, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2, cv2.LINE_AA)
+    h, w = preview.shape[:2]
+    longest = max(h, w)
+    if longest > long_side:
+        scale = long_side / float(longest)
+        preview = cv2.resize(preview, (max(1, int(w * scale)), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    return preview
+
+
 @dataclass
 class TrackBox:
     xyxy: list[int]
@@ -136,6 +151,7 @@ class YOLOEngine(QObject):
     error = pyqtSignal(str)
     poster_found_record = pyqtSignal(dict)
     finished_records = pyqtSignal(list)
+    frame_preview = pyqtSignal(object)
 
     def __init__(
         self,
@@ -238,7 +254,7 @@ class YOLOEngine(QObject):
             frame_area = max(1, width * height)
             allowed = self.allowed_class_ids()
             frame_idx = 0
-            self.progress.emit(10, "Starting YOLO.track video processing...")
+            self.progress.emit(10, "Starting video processing...")
             while not self.stop_requested:
                 ok, frame = cap.read()
                 if not ok:
@@ -274,7 +290,9 @@ class YOLOEngine(QObject):
         if elapsed > 0:
             inst = 1.0 / elapsed
             self.detect_fps_smooth = inst if self.detect_fps_smooth == 0 else 0.85 * self.detect_fps_smooth + 0.15 * inst
-        for box in self.parse_results(results, frame_idx, allowed, frame.shape):
+        boxes = self.parse_results(results, frame_idx, allowed, frame.shape)
+        self.frame_preview.emit(detector_preview(frame, boxes))
+        for box in boxes:
             if box_area(box.xyxy) >= self.min_area_ratio * frame_area:
                 self.update_crop_record(frame, box)
 
@@ -351,10 +369,10 @@ class YOLOEngine(QObject):
     def emit_frame_progress(self, frame_idx: int, total: int):
         if total > 0:
             pct = min(94, int(10 + (frame_idx / total) * 84))
-            msg = f"YOLO.track frame {frame_idx}/{total} | tracks: {len(self.crop_records)} | detect FPS: {self.detect_fps_smooth:.1f}"
+            msg = f"Frame {frame_idx}/{total} | tracks: {len(self.crop_records)} | detect FPS: {self.detect_fps_smooth:.1f}"
         else:
             pct = 50
-            msg = f"YOLO.track frame {frame_idx} | tracks: {len(self.crop_records)} | detect FPS: {self.detect_fps_smooth:.1f}"
+            msg = f"Frame {frame_idx} | tracks: {len(self.crop_records)} | detect FPS: {self.detect_fps_smooth:.1f}"
         self.progress.emit(pct, msg)
 
     def finish(self):
@@ -377,6 +395,7 @@ class YOLOWorker(QThread):
     error = pyqtSignal(str)
     poster_found_record = pyqtSignal(dict)
     finished_records = pyqtSignal(list)
+    frame_preview = pyqtSignal(object)
 
     def __init__(self, video_path: str, **engine_kwargs):
         super().__init__()
@@ -393,4 +412,5 @@ class YOLOWorker(QThread):
         self.engine.error.connect(self.error)
         self.engine.poster_found_record.connect(self.poster_found_record)
         self.engine.finished_records.connect(self.finished_records)
+        self.engine.frame_preview.connect(self.frame_preview)
         self.engine.process_video(self.video_path)

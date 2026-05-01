@@ -13,7 +13,7 @@ import cv2
 from PIL import Image
 from PyQt6.QtCore import QEvent, QPoint, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QImage, QKeySequence, QPainter, QPixmap, QShortcut
-from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QGridLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QDialog, QFileDialog, QGridLayout, QLabel, QMessageBox, QProgressBar, QPushButton, QScrollArea, QStackedWidget, QVBoxLayout, QHBoxLayout, QWidget
 
 from audio_engine import AudioEngine
 from caption_engine import ImageCaptioner
@@ -34,11 +34,19 @@ try:
 except ImportError:
     YOLOWorker = None
 
+try:
+    from maskrcnn_engine import MaskRCNNWorker
+except ImportError:
+    MaskRCNNWorker = None
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 LOAD_POSTERS_START_DIR = SCRIPT_DIR
 LOAD_VIDEO_START_DIR = SCRIPT_DIR
-MODEL_BACKEND = "yolo"
+MODEL_BACKEND = "yolo"  # "sam", "dino", "yolo", "maskrcnn"
 GALLERY_CARD_WIDTH = 230
+GALLERY_THUMB_SIZE = 220
+GALLERY_BUTTON_SIZE = 228
+DETECTOR_PREVIEW_SIZE = (320, 180)
 GALLERY_COLS = 4
 OCR_WORKER_COUNT = 2
 PENDING_TEXTS = {"OCR pending...", "OCR updating..."}
@@ -281,6 +289,8 @@ class PosterReaderApp(QWidget):
         self.focused_poster_index = -1
         self.ocr_generation = 0
         self._selecting_poster = False
+        self.last_detector_frame = None
+        self.detector_preview_expanded = False
 
         self.setWindowTitle("UNM Poster Reader")
         self.resize(1000, 700)
@@ -295,7 +305,6 @@ class PosterReaderApp(QWidget):
         self.timer.timeout.connect(self.process_frame)
         self.speaker = AudioEngine()
         self.captioner = ImageCaptioner()
-        self.ocr_engine = OCREngine()
         self.ocr_worker = OCRWorkerPool(worker_count=OCR_WORKER_COUNT)
         self.ocr_worker.ocr_ready.connect(self.on_ocr_ready)
         self.ocr_worker.ocr_progress.connect(self.on_ocr_progress)
@@ -334,13 +343,36 @@ class PosterReaderApp(QWidget):
     def init_results_screen(self):
         page = QWidget()
         layout = QVBoxLayout(page)
+
+        top_row = QWidget()
+        top_layout = QHBoxLayout(top_row)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.setSpacing(10)
+
+        top_text = QWidget()
+        top_text_layout = QVBoxLayout(top_text)
+        top_text_layout.setContentsMargins(0, 0, 0, 0)
+        top_text_layout.setSpacing(4)
+
         self.ocr_result_label = QLabel("Press T to load test images. Navigate posters with Arrow Keys. Press Enter to open.")
         self.ocr_result_label.setWordWrap(True)
-        self.ocr_global_status_label = QLabel(f"OCR/caption status: 0/0 ready | OCR workers: {OCR_WORKER_COUNT}")
+        self.ocr_global_status_label = QLabel(f"OCR/caption status: 0/0 ready")
         self.ocr_global_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.ocr_global_status_label.setWordWrap(True)
-        layout.addWidget(self.ocr_result_label)
-        layout.addWidget(self.ocr_global_status_label)
+        top_text_layout.addWidget(self.ocr_result_label)
+        top_text_layout.addWidget(self.ocr_global_status_label)
+
+        self.detector_preview_label = QLabel("Detector preview")
+        self.detector_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.detector_preview_label.setFixedSize(*DETECTOR_PREVIEW_SIZE)
+        self.detector_preview_label.setStyleSheet("background: #111; color: #ddd; border: 1px solid #777; font-size: 11px;")
+        self.detector_preview_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.detector_preview_label.setToolTip("Click to expand detector preview")
+        self.detector_preview_label.installEventFilter(self)
+
+        top_layout.addWidget(top_text, stretch=1)
+        top_layout.addWidget(self.detector_preview_label, alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(top_row)
 
         self.gallery_scroll = QScrollArea()
         self.grid_widget = QWidget()
@@ -368,6 +400,15 @@ class PosterReaderApp(QWidget):
         layout.addWidget(self.results_progress_bar)
         layout.addWidget(self.btn_stop_proc)
         page.setLayout(layout)
+        self.results_page = page
+        self.detector_overlay_label = QLabel(page)
+        self.detector_overlay_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.detector_overlay_label.setStyleSheet("background: #000; color: #ddd; border: 2px solid #444; font-size: 14px;")
+        self.detector_overlay_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.detector_overlay_label.setToolTip("Click to return detector preview to corner")
+        self.detector_overlay_label.installEventFilter(self)
+        self.detector_overlay_label.hide()
+        self.detector_overlay_label.raise_()
         self.stack.addWidget(page)
 
         for key, action in [
@@ -450,7 +491,7 @@ class PosterReaderApp(QWidget):
         if not self.video_path:
             self.on_error("No video path is available for model processing.")
             return
-        worker_cls = {"sam": SAMWorker, "dino": DINOWorker, "yolo": YOLOWorker}.get(MODEL_BACKEND.lower())
+        worker_cls = {"sam": SAMWorker, "dino": DINOWorker, "yolo": YOLOWorker, "maskrcnn": MaskRCNNWorker}.get(MODEL_BACKEND.lower())
         if worker_cls is None:
             self.on_error(f"{MODEL_BACKEND.upper()} worker is not available. Check that the engine file is in the GUI folder.")
             return
@@ -459,6 +500,12 @@ class PosterReaderApp(QWidget):
         self.model_worker.poster_found.connect(self.on_poster_found)
         self.model_worker.finished_processing.connect(self.on_model_finished)
         self.model_worker.error.connect(self.on_error)
+        if hasattr(self.model_worker, "poster_found_record"):
+            self.model_worker.poster_found_record.connect(self.on_poster_found_record)
+        if hasattr(self.model_worker, "frame_preview"):
+            self.model_worker.frame_preview.connect(self.on_detector_preview)
+        self.detector_preview_label.setText("Detector preview")
+        self.detector_preview_label.setPixmap(QPixmap())
         self.model_worker.start()
 
     def stop_model_processing(self):
@@ -470,6 +517,48 @@ class PosterReaderApp(QWidget):
     def on_progress(self, pct, status):
         self.results_progress_bar.setValue(int(pct))
         self.results_status_label.setText(str(status))
+
+    def on_detector_preview(self, frame):
+        if frame is None:
+            return
+        try:
+            self.last_detector_frame = frame.copy()
+        except Exception:
+            self.last_detector_frame = frame
+        self.update_detector_preview_pixmaps()
+
+    def update_detector_preview_pixmaps(self):
+        if self.last_detector_frame is None:
+            return
+        corner_pixmap = self.pixmap_from_bgr(self.last_detector_frame).scaled(
+            self.detector_preview_label.width(),
+            self.detector_preview_label.height(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.detector_preview_label.setPixmap(corner_pixmap)
+
+        if getattr(self, "detector_preview_expanded", False) and hasattr(self, "detector_overlay_label"):
+            overlay_pixmap = self.pixmap_from_bgr(self.last_detector_frame).scaled(
+                self.detector_overlay_label.width(),
+                self.detector_overlay_label.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.detector_overlay_label.setPixmap(overlay_pixmap)
+
+    def toggle_detector_preview_expanded(self):
+        if not hasattr(self, "detector_overlay_label"):
+            return
+        self.detector_preview_expanded = not self.detector_preview_expanded
+        if self.detector_preview_expanded:
+            self.detector_overlay_label.setGeometry(self.results_page.rect())
+            self.detector_overlay_label.show()
+            self.detector_overlay_label.raise_()
+            self.detector_overlay_label.setFocus()
+        else:
+            self.detector_overlay_label.hide()
+        self.update_detector_preview_pixmaps()
 
     def on_error(self, message):
         self.results_progress_bar.setVisible(False)
@@ -493,13 +582,64 @@ class PosterReaderApp(QWidget):
         idx = self.poster_buttons.index(btn)
         self.ocr_worker.add_task(self.poster_data[idx]["poster_key"], image_array, self.get_preprocess_options(), self.ocr_generation)
 
+    def on_poster_found_record(self, record):
+        if not isinstance(record, dict):
+            return
+        poster_id = record.get("track_id", record.get("id"))
+        btn = self.poster_id_to_button.get(poster_id)
+        if btn is None:
+            return
+        try:
+            idx = self.poster_buttons.index(btn)
+        except ValueError:
+            return
+
+        poster = self.poster_data[idx]
+        poster["track_meta"] = dict(record)
+        label = poster.get("meta_label")
+        if label is not None:
+            label.setText(self.track_meta_text(record))
+            label.setVisible(True)
+            label.adjustSize()
+
+        if self.focused_poster_index == idx:
+            self.update_status_panel_for_index(idx)
+
+        self.sort_gallery_by_quality()
+
+    def track_meta_text(self, record):
+        quality = self.format_score(record.get("quality"))
+        score = self.format_score(record.get("score"))
+        seen = self.format_int(record.get("seen_count"))
+        version = self.format_int(record.get("version"))
+        return f"Q: {quality} | Conf: {score} | Seen: {seen} | V: {version}"
+
+    def format_score(self, value):
+        try:
+            return f"{float(value):.3f}"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    def format_int(self, value):
+        try:
+            return str(int(value))
+        except (TypeError, ValueError):
+            return "N/A"
+
     def load_test_posters(self):
         if self.stack.currentIndex() != 2:
             return
         files, _ = QFileDialog.getOpenFileNames(self, "Select Test Posters", str(LOAD_POSTERS_START_DIR), "Images (*.png *.jpg *.jpeg)")
+        if not files:
+            return
+
+        self.results_status_label.setVisible(True)
+        self.results_status_label.setText(f"Queued {len(files)} local image(s) for OCR testing.")
+
         for file_path in files:
-            text, conf = self.ocr_engine.get_text(file_path, self.get_preprocess_options())
-            self.add_poster_to_gallery(file_path, text, conf)
+            self.add_poster_to_gallery(file_path, "OCR pending...", None)
+            poster = self.poster_data[-1]
+            self.ocr_worker.add_task(poster["poster_key"], file_path, self.get_preprocess_options(), self.ocr_generation)
             QApplication.processEvents()
 
     def add_poster_to_gallery(self, image_input, detected_text, avg_conf=None, poster_id=None, run_caption_async=True):
@@ -517,13 +657,24 @@ class PosterReaderApp(QWidget):
         bar.setFormat("Queued")
         bar.setFixedWidth(btn.width())
 
+        meta_label = QLabel("")
+        meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        meta_label.setWordWrap(True)
+        meta_label.setFixedWidth(GALLERY_BUTTON_SIZE)
+        meta_label.setMinimumHeight(28)
+        meta_label.setMaximumHeight(40)
+        meta_label.setStyleSheet("font-size: 10px; color: #444; padding-top: 4px; background: transparent;")
+        meta_label.setVisible(False)
+
         card = QWidget()
         card.setFixedWidth(GALLERY_CARD_WIDTH)
+        card.setMinimumHeight(GALLERY_BUTTON_SIZE + 56)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(2, 2, 2, 2)
-        card_layout.setSpacing(4)
+        card_layout.setSpacing(6)
         card_layout.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
         card_layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignHCenter)
+        card_layout.addWidget(meta_label, alignment=Qt.AlignmentFlag.AlignHCenter)
         card_layout.addWidget(bar, alignment=Qt.AlignmentFlag.AlignHCenter)
 
         poster_key = poster_id if poster_id is not None else f"manual_{len(self.poster_buttons)}"
@@ -543,6 +694,8 @@ class PosterReaderApp(QWidget):
             "ocr_stage": "OCR done" if ocr_done else "OCR queued",
             "caption_stage": "Caption queued" if run_caption_async else "Caption done",
             "loading_bar": bar,
+            "meta_label": meta_label,
+            "track_meta": None,
             "card": card,
             "button": btn,
         }
@@ -674,7 +827,14 @@ class PosterReaderApp(QWidget):
         if not (0 <= idx < len(self.poster_data)):
             return
         poster = self.poster_data[idx]
-        self.ocr_result_label.setText(f"Description: {poster['description']}\n\nDetected Text: {poster['detected_text']}\n\nConfidence: {poster['confidence']}")
+        parts = [
+            f"Description: {poster['description']}",
+            f"Detected Text: {poster['detected_text']}",
+            f"Confidence: {poster['confidence']}",
+        ]
+        # if poster.get("track_meta"):
+        #     parts.append(f"Track: {self.track_meta_text(poster['track_meta'])}")
+        self.ocr_result_label.setText("\n\n".join(parts))
 
     def select_poster_index(self, idx, *, scroll=True, focus=True):
         if not (0 <= idx < len(self.poster_data)):
@@ -694,12 +854,12 @@ class PosterReaderApp(QWidget):
     def update_global_processing_status(self):
         total = len(self.poster_data)
         if total == 0:
-            self.ocr_global_status_label.setText(f"OCR/caption status: 0/0 ready | OCR workers: {OCR_WORKER_COUNT}")
+            self.ocr_global_status_label.setText(f"OCR/caption status: 0/0 ready")
             return
         ocr_done = sum(1 for p in self.poster_data if p["ocr_done"])
         caption_done = sum(1 for p in self.poster_data if p["caption_done"])
         ready = sum(1 for p in self.poster_data if p["ocr_done"] and p["caption_done"])
-        self.ocr_global_status_label.setText(f"Ready {ready}/{total} | OCR {ocr_done}/{total} complete ({total - ocr_done} pending) | Captions {caption_done}/{total} complete ({total - caption_done} pending) | OCR workers: {OCR_WORKER_COUNT}")
+        self.ocr_global_status_label.setText(f"Ready {ready}/{total} | OCR {ocr_done}/{total} complete ({total - ocr_done} pending) | Captions {caption_done}/{total} complete ({total - caption_done} pending)")
 
     def find_poster_index_by_key(self, poster_key):
         for idx, poster in enumerate(self.poster_data):
@@ -707,7 +867,52 @@ class PosterReaderApp(QWidget):
                 return idx
         return None
 
+    def sort_gallery_by_quality(self):
+        if not self.poster_data:
+            return
+
+        focused_key = None
+        if 0 <= self.focused_poster_index < len(self.poster_data):
+            focused_key = self.poster_data[self.focused_poster_index].get("poster_key")
+
+        indexed_items = list(enumerate(zip(self.poster_data, self.poster_buttons)))
+
+        def quality_sort_value(item):
+            original_index, (poster, _btn) = item
+            meta = poster.get("track_meta") or {}
+            try:
+                quality = float(meta.get("quality"))
+            except (TypeError, ValueError):
+                quality = float("-inf")
+            return (-quality, original_index)
+
+        sorted_items = sorted(indexed_items, key=quality_sort_value)
+        if [old_index for old_index, _item in sorted_items] == list(range(len(indexed_items))):
+            return
+
+        while self.grid_layout.count():
+            self.grid_layout.takeAt(0)
+
+        self.poster_data = [poster for _old_index, (poster, _btn) in sorted_items]
+        self.poster_buttons = [btn for _old_index, (_poster, btn) in sorted_items]
+
+        for idx, poster in enumerate(self.poster_data):
+            self.grid_layout.addWidget(poster["card"], idx // GALLERY_COLS, idx % GALLERY_COLS)
+
+        if focused_key is not None:
+            self.focused_poster_index = self.find_poster_index_by_key(focused_key) or 0
+        elif self.poster_data:
+            self.focused_poster_index = 0
+
     def clear_gallery(self):
+        self.last_detector_frame = None
+        self.detector_preview_expanded = False
+        if hasattr(self, "detector_preview_label"):
+            self.detector_preview_label.setText("Detector preview")
+            self.detector_preview_label.setPixmap(QPixmap())
+        if hasattr(self, "detector_overlay_label"):
+            self.detector_overlay_label.hide()
+            self.detector_overlay_label.setPixmap(QPixmap())
         self.poster_id_to_button = {}
         while self.grid_layout.count():
             item = self.grid_layout.takeAt(0)
@@ -741,13 +946,17 @@ class PosterReaderApp(QWidget):
         preview = self.make_display_pixmap(image_input)
         if preview.isNull():
             return
-        thumbnail = preview.scaled(220, 220, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+        thumbnail = preview.scaled(GALLERY_THUMB_SIZE, GALLERY_THUMB_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
         btn.setIcon(QIcon(thumbnail))
         btn.setIconSize(thumbnail.size())
-        btn.setFixedSize(thumbnail.width() + 8, thumbnail.height() + 8)
+        btn.setFixedSize(GALLERY_BUTTON_SIZE, GALLERY_BUTTON_SIZE)
+        btn.setMinimumSize(GALLERY_BUTTON_SIZE, GALLERY_BUTTON_SIZE)
         for poster in self.poster_data:
             if poster.get("button") is btn:
-                poster["loading_bar"].setFixedWidth(btn.width())
+                poster["loading_bar"].setFixedWidth(GALLERY_BUTTON_SIZE)
+                meta_label = poster.get("meta_label")
+                if meta_label is not None:
+                    meta_label.setFixedWidth(GALLERY_BUTTON_SIZE)
                 break
 
     def pixmap_from_bgr(self, image_bgr):
@@ -793,6 +1002,14 @@ class PosterReaderApp(QWidget):
         self.show_zoom_dialog(self.make_display_pixmap(poster["image_input"]), display_text)
 
     def eventFilter(self, obj, event):
+        if obj is getattr(self, "detector_preview_label", None) and event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.toggle_detector_preview_expanded()
+                return True
+        if obj is getattr(self, "detector_overlay_label", None) and event.type() == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.toggle_detector_preview_expanded()
+                return True
         if obj in self.poster_buttons and event.type() in (QEvent.Type.FocusIn, QEvent.Type.Enter, QEvent.Type.MouseButtonPress):
             self.select_poster_index(self.poster_buttons.index(obj), scroll=event.type() == QEvent.Type.FocusIn, focus=event.type() != QEvent.Type.FocusIn)
         return super().eventFilter(obj, event)
@@ -815,6 +1032,12 @@ class PosterReaderApp(QWidget):
         layout.addWidget(text_label)
         image_view.setFocus()
         dialog.exec()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if getattr(self, "detector_preview_expanded", False) and hasattr(self, "detector_overlay_label"):
+            self.detector_overlay_label.setGeometry(self.results_page.rect())
+            self.update_detector_preview_pixmaps()
 
     def closeEvent(self, event):
         if self.model_worker is not None and self.model_worker.isRunning():
