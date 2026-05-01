@@ -1,9 +1,8 @@
-import math
-import time
+import gc
 import cv2
-import torch
 import numpy as np
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+import torch
+from PyQt6.QtCore import QObject, QThread, pyqtSignal
 
 try:
     from sam3.model_builder import build_sam3_video_predictor
@@ -11,90 +10,66 @@ except ImportError:
     build_sam3_video_predictor = None
 
 CENTROID_THRESHOLD = 250
+MIN_AREA_RATIO = 0.0005
+PROMPT = "flyer, poster"
 
-def get_centroid(bbox):
-    x_coords = [p[0] for p in bbox]
-    y_coords = [p[1] for p in bbox]
-    return (int(sum(x_coords)/len(x_coords)), int(sum(y_coords)/len(y_coords)))
 
-def euclidean(c1, c2):
-    return math.sqrt((c1[0]-c2[0])**2 + (c1[1]-c2[1])**2)
+def centroid(box):
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
+    return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
 
-def bbox_area(bbox):
-    x_coords = [p[0] for p in bbox]
-    y_coords = [p[1] for p in bbox]
-    return (max(x_coords)-min(x_coords)) * (max(y_coords)-min(y_coords))
 
-def bbox_xyxy(bbox):
-    xs = [p[0] for p in bbox]
-    ys = [p[1] for p in bbox]
+def dist(a, b):
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+def xyxy(box):
+    xs = [p[0] for p in box]
+    ys = [p[1] for p in box]
     return min(xs), min(ys), max(xs), max(ys)
 
-def bbox_iou(b1, b2):
-    x1a, y1a, x2a, y2a = bbox_xyxy(b1)
-    x1b, y1b, x2b, y2b = bbox_xyxy(b2)
 
-    xi1 = max(x1a, x1b)
-    yi1 = max(y1a, y1b)
-    xi2 = min(x2a, x2b)
-    yi2 = min(y2a, y2b)
+def area(box):
+    x1, y1, x2, y2 = xyxy(box)
+    return max(0, x2 - x1) * max(0, y2 - y1)
 
-    inter_w = max(0, xi2 - xi1)
-    inter_h = max(0, yi2 - yi1)
-    inter = inter_w * inter_h
 
-    area_a = max(0, x2a - x1a) * max(0, y2a - y1a)
-    area_b = max(0, x2b - x1b) * max(0, y2b - y1b)
-    union = area_a + area_b - inter
-
+def iou(a, b):
+    ax1, ay1, ax2, ay2 = xyxy(a)
+    bx1, by1, bx2, by2 = xyxy(b)
+    x1, y1 = max(ax1, bx1), max(ay1, by1)
+    x2, y2 = min(ax2, bx2), min(ay2, by2)
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    union = area(a) + area(b) - inter
     return inter / union if union > 0 else 0.0
 
-def score_frame(frame, bbox):
-    x_coords = [p[0] for p in bbox]
-    y_coords = [p[1] for p in bbox]
-    x_min, x_max = min(x_coords), max(x_coords)
-    y_min, y_max = min(y_coords), max(y_coords)
 
-    crop = frame[y_min:y_max, x_min:x_max]
+def pad_box(box, shape, pad=1):
+    h, w = shape[:2]
+    x1, y1, x2, y2 = xyxy(box)
+    x1, y1 = max(0, x1 - pad), max(0, y1 - pad)
+    x2, y2 = min(w, x2 + pad), min(h, y2 + pad)
+    return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+
+
+def crop_box(frame, box):
+    x1, y1, x2, y2 = xyxy(box)
+    return frame[y1:y2, x1:x2]
+
+
+def crop_score(frame, box):
+    crop = crop_box(frame, box)
     if crop.size == 0:
-        return 0, crop
-
+        return 0.0, crop
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    sharpness = cv2.Laplacian(blurred, cv2.CV_64F).var()
+    sharpness = cv2.Laplacian(cv2.GaussianBlur(gray, (3, 3), 0), cv2.CV_64F).var()
+    contrast = max(gray.std() / 255.0, 1e-6)
+    x1, y1, x2, y2 = xyxy(box)
+    aspect = min((x2 - x1) / max(1, y2 - y1), 3.0)
+    boundary = 0.6 if x1 <= 5 or y1 <= 5 or x2 >= frame.shape[1] - 5 or y2 >= frame.shape[0] - 5 else 1.0
+    return float(sharpness * contrast * np.log1p(area(box)) * aspect * boundary), crop
 
-    contrast = gray.std() / 255.0
-    contrast = max(contrast, 1e-6)
-
-    w = x_max - x_min
-    h = y_max - y_min
-    area = w * h
-    area_score = math.log1p(area)
-
-    aspect = (w / h) if h > 0 else 0
-    aspect_bonus = min(aspect, 3.0)
-
-    fh, fw = frame.shape[:2]
-    margin = 5
-    on_boundary = (
-        x_min <= margin or y_min <= margin or
-        x_max >= fw - margin or y_max >= fh - margin
-    )
-    boundary_penalty = 0.6 if on_boundary else 1.0
-
-    combined = sharpness * contrast * area_score * aspect_bonus * boundary_penalty
-    return combined, crop
-
-def pad_bbox(bbox, frame_shape, pad=60):
-    fh, fw = frame_shape[:2]
-    x_coords = [p[0] for p in bbox]
-    y_coords = [p[1] for p in bbox]
-    x_min = max(0,  min(x_coords) - pad)
-    x_max = min(fw, max(x_coords) + pad)
-    y_min = max(0,  min(y_coords) - pad)
-    y_max = min(fh, max(y_coords) + pad)
-    return [[x_min, y_min], [x_max, y_min],
-            [x_max, y_max], [x_min, y_max]]
 
 class SAMEngine(QObject):
     progress = pyqtSignal(int, str)
@@ -102,9 +77,8 @@ class SAMEngine(QObject):
     poster_found = pyqtSignal(int, object)
     error = pyqtSignal(str)
 
-    def __init__(self, checkpoint_path="sam3_video_predictor.pt"):
+    def __init__(self):
         super().__init__()
-        self.checkpoint_path = checkpoint_path
         self.video_predictor = None
         self.stop_requested = False
 
@@ -114,195 +88,81 @@ class SAMEngine(QObject):
     def load_model(self):
         if self.video_predictor is not None:
             return True
-            
         if build_sam3_video_predictor is None:
             self.error.emit("SAM3 is not installed. Please install it to use SAM.")
             return False
-
-        self.progress.emit(5, "Building SAM3 model (this could take a while)...")
+        self.progress.emit(5, "Building SAM3 model...")
         try:
             self.video_predictor = build_sam3_video_predictor()
             return True
-        except Exception as e:
-            self.error.emit(f"Failed to load SAM3: {str(e)}")
+        except Exception as exc:
+            self.error.emit(f"Failed to load SAM3: {exc}")
             return False
 
     def process_video(self, video_path):
         self.stop_requested = False
-        
         if not self.load_model():
             return
-
-        self.progress.emit(10, "Starting SAM3 session...")
+        cap = cv2.VideoCapture(str(video_path))
+        if not cap.isOpened():
+            self.error.emit(f"Could not open video file: {video_path}")
+            return
         session_id = None
-        cap = None
-        writer = None
         try:
-            unique_signs = []
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                self.error.emit(f"Could not open video file: {video_path}")
-                return
-
-            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            
-            FRAME_SKIP = 1
-
-
-
-            response = self.video_predictor.handle_request(
-                request=dict(
-                    type="start_session",
-                    resource_path=video_path,
-                )
-            )
+            frame_area = max(1, width * height)
+            tracks = []
+            response = self.video_predictor.handle_request(request={"type": "start_session", "resource_path": str(video_path)})
             session_id = response["session_id"]
-            
             frame_idx = 0
-
-            
+            self.progress.emit(10, "Starting SAM3 session...")
             while not self.stop_requested:
-                ret, frame = cap.read()
-                if not ret:
+                ok, frame = cap.read()
+                if not ok:
                     break
-
-                if frame_idx % FRAME_SKIP == 0:
-
-                    response = self.video_predictor.handle_request(
-                        request=dict(
-                            type="add_prompt",
-                            session_id=session_id,
-                            frame_index=frame_idx,
-                            text="flyer, poster",
-                        )
-                    )
-
-                    outputs = response.get("outputs", {})
-                    boxes = outputs.get("out_boxes_xywh", [])
-
-                    for box in boxes:
-                        x, y, w, h = box
-                        x1 = int(x * width)
-                        y1 = int(y * height)
-                        x2 = int((x + w) * width)
-                        y2 = int((y + h) * height)
-
-                        bbox = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
-                        BOX_PAD = 1
-                        bbox = pad_bbox(bbox, frame.shape, pad=BOX_PAD)
-
-                        if bbox_area(bbox) < 0.0005 * (width * height):
-                            continue
-
-                        centroid = get_centroid(bbox)
-
-
-                        matched = False
-                        for sign in unique_signs:
-                            dist = euclidean(centroid, sign['centroid'])
-                            iou  = bbox_iou(bbox, sign['bbox'])
-
-                            if dist < CENTROID_THRESHOLD and iou > 0.15:
-                                matched = True
-                                sign['centroid'] = (
-                                    int(0.7 * sign['centroid'][0] + 0.3 * centroid[0]),
-                                    int(0.7 * sign['centroid'][1] + 0.3 * centroid[1])
-                                )
-                                sign['bbox'] = bbox
-
-                                score, crop = score_frame(frame, bbox)
-                                if crop.size > 0:
-                                    # Find if this is the best so far
-                                    old_best = max(sign['candidates'], key=lambda x: x['score'])['score'] if sign['candidates'] else -1
-                                    
-                                    sign['candidates'].append({
-                                        'frame_idx': frame_idx,
-                                        'score': score,
-                                        'crop': crop.copy(),
-                                        'bbox': bbox
-                                    })
-                                    
-                                    if score > old_best:
-                                        self.poster_found.emit(unique_signs.index(sign), crop)
-                                break
-
-                        if not matched:
-                            score, crop = score_frame(frame, bbox)
-                            if crop.size > 0:
-                                new_sign = {
-                                    'centroid': centroid,
-                                    'bbox': bbox,
-                                    'first_frame': frame_idx,
-                                    'candidates': [{
-                                        'frame_idx': frame_idx,
-                                        'score': score,
-                                        'crop': crop.copy(),
-                                        'bbox': bbox
-                                    }]
-                                }
-                                unique_signs.append(new_sign)
-                                self.poster_found.emit(len(unique_signs) - 1, crop)
-
-
-
-
-
-
-
-
-
+                response = self.video_predictor.handle_request(request={"type": "add_prompt", "session_id": session_id, "frame_index": frame_idx, "text": PROMPT})
+                for x, y, w, h in response.get("outputs", {}).get("out_boxes_xywh", []):
+                    box = pad_box([[int(x * width), int(y * height)], [int((x + w) * width), int(y * height)], [int((x + w) * width), int((y + h) * height)], [int(x * width), int((y + h) * height)]], frame.shape)
+                    if area(box) >= MIN_AREA_RATIO * frame_area:
+                        self.update_tracks(tracks, frame, box, frame_idx)
                 frame_idx += 1
-                
-                if total > 0:
-                    pct = int(10 + (frame_idx / total) * 80)
-                    self.progress.emit(pct, f"Processing frame {frame_idx}/{total}...")
-                else:
-                    self.progress.emit(50, f"Processing frame {frame_idx}...")
-
-            if self.stop_requested:
-                self.progress.emit(95, "Stopping and collecting current best crops...")
-            else:
-                self.progress.emit(95, "Finishing up...")
-            
-            best_crops = []
-            for s in unique_signs:
-                if s['candidates']:
-                    best_cand = max(s['candidates'], key=lambda x: x['score'])
-                    best_crops.append(best_cand['crop'])
-            
-            if self.stop_requested:
-                self.progress.emit(100, "Stopped")
-            else:
-                self.progress.emit(100, "Done")
-
-            self.finished.emit(best_crops)
-
-        except Exception as e:
-            self.error.emit(f"Error during SAM processing: {str(e)}")
-
+                pct = int(10 + (frame_idx / total) * 80) if total > 0 else 50
+                self.progress.emit(pct, f"Processing frame {frame_idx}/{total}..." if total > 0 else f"Processing frame {frame_idx}...")
+            self.progress.emit(95, "Stopping and collecting current best crops..." if self.stop_requested else "Finishing up...")
+            best = [max(track["candidates"], key=lambda item: item["score"])["crop"] for track in tracks if track["candidates"]]
+            self.progress.emit(100, "Stopped" if self.stop_requested else "Done")
+            self.finished.emit(best)
+        except Exception as exc:
+            self.error.emit(f"Error during SAM processing: {exc}")
         finally:
-            if cap is not None:
-                cap.release()
-
+            cap.release()
             if self.video_predictor is not None and session_id is not None:
                 try:
-                    self.video_predictor.handle_request(
-                        request=dict(
-                            type="close_session",
-                            session_id=session_id,
-                            run_gc_collect=True,
-                        )
-                    )
+                    self.video_predictor.handle_request(request={"type": "close_session", "session_id": session_id, "run_gc_collect": True})
                 except Exception:
                     pass
-
-            import gc
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+
+    def update_tracks(self, tracks, frame, box, frame_idx):
+        c = centroid(box)
+        score, crop = crop_score(frame, box)
+        if crop.size == 0:
+            return
+        for idx, track in enumerate(tracks):
+            if dist(c, track["centroid"]) < CENTROID_THRESHOLD and iou(box, track["bbox"]) > 0.15:
+                old_best = max(track["candidates"], key=lambda item: item["score"])["score"] if track["candidates"] else -1
+                track["centroid"] = int(0.7 * track["centroid"][0] + 0.3 * c[0]), int(0.7 * track["centroid"][1] + 0.3 * c[1])
+                track["bbox"] = box
+                track["candidates"].append({"frame_idx": frame_idx, "score": score, "crop": crop.copy(), "bbox": box})
+                if score > old_best:
+                    self.poster_found.emit(idx, crop)
+                return
+        tracks.append({"centroid": c, "bbox": box, "first_frame": frame_idx, "candidates": [{"frame_idx": frame_idx, "score": score, "crop": crop.copy(), "bbox": box}]})
+        self.poster_found.emit(len(tracks) - 1, crop)
 
 
 class SAMWorker(QThread):
@@ -313,7 +173,7 @@ class SAMWorker(QThread):
 
     def __init__(self, video_path):
         super().__init__()
-        self.video_path = video_path
+        self.video_path = str(video_path)
         self.engine = SAMEngine()
 
     def request_stop(self):
