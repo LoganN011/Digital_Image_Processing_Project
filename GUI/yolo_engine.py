@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -25,12 +25,13 @@ DEFAULT_CONF = 0.35
 DEFAULT_IOU = 0.30
 DEFAULT_MAX_DET = 30
 DEFAULT_IMGSZ = 224
-DEFAULT_FRAME_SKIP = 2
+DEFAULT_FRAME_SKIP = 3
 DEFAULT_PAD_RATIO = 0.04
 DEFAULT_BOX_PAD_PIXELS = 1
 DEFAULT_MIN_STABLE_FRAMES = 3
 DEFAULT_MIN_AREA_RATIO = 0.0005
 DEFAULT_TRACKER_NAME = "bytetrack.yaml"
+MAX_STORED_CROPS_PER_TRACK = 0  # 0 means keep every accepted crop candidate for debugging.
 
 
 def resolve_local_path(path: str | Path) -> str:
@@ -84,6 +85,72 @@ def crop_quality(frame: np.ndarray, box: list[int], detector_score: float) -> fl
     return 0.42 * float(detector_score) + 0.33 * sharp_score + 0.18 * area_score + 0.07 * aspect_score - edge_penalty
 
 
+def make_crop_candidate(
+    *,
+    candidate_index: int,
+    frame_idx: int,
+    raw_box: list[int],
+    crop_box: list[int],
+    crop: np.ndarray,
+    quality: float,
+    detector_score: float,
+) -> dict[str, Any]:
+    x1, y1, x2, y2 = crop_box
+    return {
+        "candidate_index": int(candidate_index),
+        "frame_index": int(frame_idx),
+        "bbox": list(crop_box),
+        "raw_bbox": list(raw_box),
+        "quality": float(quality),
+        "score": float(detector_score),
+        "area": int(box_area(crop_box)),
+        "width": int(max(0, x2 - x1)),
+        "height": int(max(0, y2 - y1)),
+        "is_best": False,
+        "crop": crop.copy(),
+    }
+
+
+def refresh_candidate_flags(rec: "CropRecord") -> None:
+    for candidate in rec.all_crops:
+        candidate["is_best"] = int(candidate.get("candidate_index", -1)) == int(rec.best_candidate_index)
+
+
+def trim_stored_candidates(rec: "CropRecord") -> None:
+    if MAX_STORED_CROPS_PER_TRACK and len(rec.all_crops) > MAX_STORED_CROPS_PER_TRACK:
+        rec.all_crops = rec.all_crops[-MAX_STORED_CROPS_PER_TRACK:]
+
+
+def sync_best_to_highest_quality_candidate(rec: "CropRecord") -> bool:
+    """Make the displayed best crop match the highest-Q stored candidate.
+
+    Returns True when the displayed best candidate changed. This deliberately
+    does not use the old +0.035 replacement margin because the debugging pane
+    should not show a higher-Q candidate while the displayed crop remains a
+    lower-Q crop.
+    """
+    if not rec.all_crops:
+        return False
+
+    old_best_index = int(rec.best_candidate_index)
+    best = max(
+        rec.all_crops,
+        key=lambda item: (
+            float(item.get("quality", float("-inf"))),
+            int(item.get("candidate_index", 0)),
+        ),
+    )
+
+    rec.best_candidate_index = int(best.get("candidate_index", old_best_index))
+    rec.best_quality = float(best.get("quality", rec.best_quality))
+    rec.best_score = float(best.get("score", rec.best_score))
+    rec.best_box = list(best.get("bbox", rec.best_box))
+    if isinstance(best.get("crop"), np.ndarray):
+        rec.best_crop = best["crop"].copy()
+    refresh_candidate_flags(rec)
+    return rec.best_candidate_index != old_best_index
+
+
 def detector_preview(frame: np.ndarray, boxes: list["TrackBox"], long_side: int = 480) -> np.ndarray:
     preview = frame.copy()
     for box in boxes:
@@ -123,8 +190,11 @@ class CropRecord:
     first_frame: int
     last_seen_frame: int
     ready_for_ocr: bool = False
+    all_crops: list[dict[str, Any]] = field(default_factory=list)
+    best_candidate_index: int = 1
 
     def summary(self, include_crop: bool = True) -> dict[str, Any]:
+        refresh_candidate_flags(self)
         out = {
             "id": self.object_id,
             "track_id": self.object_id,
@@ -138,9 +208,19 @@ class CropRecord:
             "first_frame": int(self.first_frame),
             "last_seen_frame": int(self.last_seen_frame),
             "ready_for_ocr": bool(self.ready_for_ocr),
+            "best_candidate_index": int(self.best_candidate_index),
+            "num_crop_candidates": int(len(self.all_crops)),
         }
         if include_crop:
             out["crop"] = self.best_crop.copy()
+
+        crop_history = []
+        for candidate in self.all_crops:
+            item = {k: v for k, v in candidate.items() if k != "crop"}
+            if include_crop and isinstance(candidate.get("crop"), np.ndarray):
+                item["crop"] = candidate["crop"].copy()
+            crop_history.append(item)
+        out["all_crops"] = crop_history
         return out
 
 
@@ -337,29 +417,62 @@ class YOLOEngine(QObject):
         quality = crop_quality(frame, expanded, box.score)
         if quality < 0.05:
             return False
+
         rec = self.crop_records.get(box.track_id)
+        candidate_index = 1 if rec is None else len(rec.all_crops) + 1
+        candidate = make_crop_candidate(
+            candidate_index=candidate_index,
+            frame_idx=box.frame_index,
+            raw_box=list(box.xyxy),
+            crop_box=list(expanded),
+            crop=crop,
+            quality=quality,
+            detector_score=box.score,
+        )
+
         if rec is None:
-            rec = CropRecord(box.track_id, box.label, box.cls_id, crop.copy(), expanded, quality, box.score, 1, 1, box.frame_index, box.frame_index, self.min_stable_frames <= 1)
+            candidate["is_best"] = True
+            rec = CropRecord(
+                box.track_id,
+                box.label,
+                box.cls_id,
+                crop.copy(),
+                expanded,
+                quality,
+                box.score,
+                1,
+                1,
+                box.frame_index,
+                box.frame_index,
+                self.min_stable_frames <= 1,
+                all_crops=[candidate],
+                best_candidate_index=candidate_index,
+            )
             self.crop_records[box.track_id] = rec
             self.emit_record(rec)
             return True
+
+        rec.all_crops.append(candidate)
+        trim_stored_candidates(rec)
         rec.seen_count += 1
         rec.last_seen_frame = box.frame_index
         became_ready = rec.seen_count >= self.min_stable_frames and not rec.ready_for_ocr
         if became_ready:
             rec.ready_for_ocr = True
-        improved = quality > rec.best_quality + 0.035
-        if improved:
-            rec.best_crop = crop.copy()
-            rec.best_box = expanded
-            rec.best_quality = quality
-            rec.best_score = box.score
+
+        best_changed = sync_best_to_highest_quality_candidate(rec)
+        if best_changed:
             rec.label = box.label
             rec.cls_id = box.cls_id
             rec.version += 1
-        if improved or became_ready:
+
+        if best_changed or became_ready:
             self.emit_record(rec)
             return True
+
+        # Metadata-only update: lets the GUI show the full crop-candidate history
+        # without replacing the displayed best crop or re-queuing OCR.
+        self.poster_found_record.emit(rec.summary(include_crop=True))
         return False
 
     def emit_record(self, rec: CropRecord):
@@ -369,10 +482,10 @@ class YOLOEngine(QObject):
     def emit_frame_progress(self, frame_idx: int, total: int):
         if total > 0:
             pct = min(94, int(10 + (frame_idx / total) * 84))
-            msg = f"Frame {frame_idx}/{total} | tracks: {len(self.crop_records)} | detect FPS: {self.detect_fps_smooth:.1f}"
+            msg = f"frame {frame_idx}/{total} | tracks: {len(self.crop_records)} | detect FPS: {self.detect_fps_smooth:.1f}"
         else:
             pct = 50
-            msg = f"Frame {frame_idx} | tracks: {len(self.crop_records)} | detect FPS: {self.detect_fps_smooth:.1f}"
+            msg = f"frame {frame_idx} | tracks: {len(self.crop_records)} | detect FPS: {self.detect_fps_smooth:.1f}"
         self.progress.emit(pct, msg)
 
     def finish(self):

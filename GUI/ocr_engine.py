@@ -59,6 +59,32 @@ def clean_ocr_text(text: str) -> str:
     return re.sub(r"\s+([,.;:!?])", r"\1", text)
 
 
+def maybe_split_parseq_text(text: str) -> str:
+    """Add likely missing spaces in PARSeq output, without touching URLs/emails/etc.
+
+    PARSeq often recognizes a whole cropped text line as one continuous token
+    even when EasyOCR detected it as a line containing multiple words. This
+    helper is intentionally applied only to PARSeq text, before OCRLine is
+    created, so OCRLine.text and OCRLine.parseq_text stay consistent.
+    """
+    text = clean_ocr_text(text)
+    if not text or " " in text or len(text) <= 6:
+        return text
+    if any(ch in text for ch in ("@", "/", "\\", "_", ".", ":")):
+        return text
+    if not re.search(r"[A-Za-z]", text):
+        return text
+    try:
+        import wordninja
+    except Exception:
+        return text
+    try:
+        split = wordninja.split(text)
+    except Exception:
+        return text
+    return " ".join(split) if len(split) > 1 else text
+
+
 def preprocess_for_ocr(crop_bgr: np.ndarray) -> np.ndarray:
     if crop_bgr is None or crop_bgr.size == 0:
         return crop_bgr
@@ -325,7 +351,7 @@ class OCREngine:
         crop = crop_easyocr_text_region(image, item[0])
         if crop is not None and crop.size > 0:
             parseq_text, parseq_conf = self.run_parseq_on_text_crop(crop)
-            parseq_text = clean_ocr_text(parseq_text)
+            parseq_text = maybe_split_parseq_text(parseq_text)
         if parseq_text:
             return OCRLine(parseq_text, float(parseq_conf), "PARSeq", item[0], parseq_text, float(parseq_conf), easy_text, float(easy_conf))
         if easy_text:
