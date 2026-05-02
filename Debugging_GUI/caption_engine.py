@@ -10,7 +10,7 @@ class ImageCaptioner:
         )
         self.model = BlipForConditionalGeneration.from_pretrained(
             model_name,
-            use_safetensors=True,
+            use_safetensors=False,
         ).eval()
 
     def generate_caption(self, pil_image):
