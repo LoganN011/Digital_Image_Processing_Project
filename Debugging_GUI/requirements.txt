@@ -1,0 +1,51 @@
+# Poster Reader GUI requirements
+# For:
+#   GUI_Main.py, yolo_engine.py, ocr_engine.py, caption_engine.py, audio_engine.py
+#
+# Recommended Python: 3.11
+#
+# Notes:
+# - NumPy is pinned below 2.x to avoid common Torch/OpenCV binary issues.
+# - On macOS, audio_engine.py uses the built-in `say` command, so pyttsx3 is NOT
+#   installed there. On Windows/Linux, pyttsx3 is installed for fallback TTS.
+# - EasyOCR brings opencv-python-headless; this avoids installing both GUI and
+#   headless OpenCV wheels at the same time.
+
+numpy==1.26.4
+Pillow>=10,<13
+
+PyQt6>=6.6,<6.10
+
+torch==2.2.2
+torchvision==0.17.2
+
+transformers>=4.38,<5
+safetensors>=0.4
+huggingface-hub>=0.23,<1
+
+ultralytics>=8.3,<9
+lapx>=0.5.2
+
+easyocr==1.7.2
+opencv-python-headless==4.11.0.86
+wordninja>=2.0
+
+# PARSeq / torch.hub support used by ocr_engine.py
+timm>=0.9
+pytorch-lightning>=2.2
+hydra-core>=1.3
+omegaconf>=2.3
+lmdb>=1.4
+nltk>=3.8
+
+# EasyOCR/scientific dependencies
+scikit-image>=0.22
+scipy>=1.11
+python-bidi>=0.4
+PyYAML>=6
+Shapely>=2
+pyclipper>=1.3
+ninja>=1.11
+
+# audio_engine.py fallback for non-macOS only.
+pyttsx3>=2.90; platform_system != "Darwin"
