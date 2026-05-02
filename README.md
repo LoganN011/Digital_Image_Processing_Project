@@ -13,18 +13,31 @@ The GUI requires the following Python packages:
 | `pyttsx3` | `audio_engine.py` | Text-to-speech |
 | `transformers` | `caption_engine.py` | BLIP image captioning model |
 | `torch` | `caption_engine.py`, `sam_engine.py` | ML backend |
+| `torchvision` | `ocr_engine.py` | Image transformations for OCR |
 | `easyocr` | `ocr_engine.py` | Optical character recognition |
 | `numpy` | `ocr_engine.py` | Array operations |
+| `timm` | `ocr_engine.py` | Image models for PARSeq |
+| `nltk` | `ocr_engine.py` | Text tokenization for PARSeq |
+| `wordninja` | `ocr_engine.py` | Word splitting for OCR |
+| `pytorch-lightning` | `ocr_engine.py` | Required by PARSeq |
 | `huggingface_hub` | `sam_engine.py` | Model weight downloading |
 | `sam3` | `sam_engine.py` | Segment Anything Model 3 |
 | `groundingdino` | `dino_engine.py` | Object detection model |
 
-### Install All at Once (Local)
+### Install All at Once (Main GUI)
 
 ```bash
-pip install PyQt6 opencv-python Pillow pyttsx3 transformers torch easyocr numpy huggingface_hub pycocotools timm einops ftfy pywin32
+pip install PyQt6 opencv-python Pillow pyttsx3 transformers torch torchvision easyocr numpy huggingface_hub pycocotools timm einops ftfy pywin32 wordninja nltk pytorch-lightning
 pip install git+https://github.com/facebookresearch/sam3.git
 pip install git+https://github.com/IDEA-Research/GroundingDINO.git
+```
+
+### Install All at Once (Debugging GUI)
+
+The `Debugging_GUI` uses YOLO for rapid video processing instead of SAM3 or Grounding DINO.
+
+```bash
+pip install PyQt6 opencv-python Pillow pyttsx3 transformers torch torchvision easyocr numpy timm einops ftfy pywin32 wordninja nltk pytorch-lightning ultralytics
 ```
 
 # Computer Vision Engines

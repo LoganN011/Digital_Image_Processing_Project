@@ -157,48 +157,28 @@ class OCRWorker(QThread):
     def __init__(self, ocr_engine):
         super().__init__()
         self.ocr_engine = ocr_engine
-        self.pending_tasks = {} # poster_id -> (image, options)
+        self.pending_tasks = {} # poster_id -> image
         self._lock = threading.Lock()
         self._running = True
 
-    def add_task(self, poster_id, image_input, preprocess_options):
+    def add_task(self, poster_id, image_input):
         with self._lock:
-            self.pending_tasks[poster_id] = (image_input, preprocess_options)
+            self.pending_tasks[poster_id] = image_input
 
     def run(self):
         while self._running:
             task = None
             with self._lock:
                 if self.pending_tasks:
-                    # Get the first poster_id and its latest image/options
+                    # Get the first poster_id and its latest image
                     pid = next(iter(self.pending_tasks))
-                    task = (pid, *self.pending_tasks.pop(pid))
+                    task = (pid, self.pending_tasks.pop(pid))
             
             if task:
-                poster_id, image_input, options = task
+                poster_id, image_input = task
                 try:
-                    # Pass 1: Raw Original Image
-                    raw_options = {"grayscale": False, "scale": 1.0, "threshold": False, "sharpen": False, "median": False}
-                    text_raw, conf_raw = self.ocr_engine.get_text(image_input, raw_options)
-                    
-                    # Pass 2: User's Preprocessed Image
-                    text_proc, conf_proc = self.ocr_engine.get_text(image_input, options)
-                    
-                    # Determine which result has higher confidence
-                    c_raw = conf_raw if conf_raw is not None else 0.0
-                    c_proc = conf_proc if conf_proc is not None else 0.0
-                    
-                    # Also consider if one produced text and the other didn't
-                    if text_raw == "No text detected." and text_proc != "No text detected.":
-                        best_text, best_conf = text_proc, conf_proc
-                    elif text_proc == "No text detected." and text_raw != "No text detected.":
-                        best_text, best_conf = text_raw, conf_raw
-                    elif c_proc > c_raw:
-                        best_text, best_conf = text_proc, conf_proc
-                    else:
-                        best_text, best_conf = text_raw, conf_raw
-                        
-                    self.ocr_ready.emit(poster_id, best_text, best_conf)
+                    text, conf = self.ocr_engine.get_text(image_input)
+                    self.ocr_ready.emit(poster_id, text, conf)
                 except Exception:
                     pass
             else:
@@ -432,8 +412,6 @@ class PosterReaderApp(QWidget):
 
     def on_poster_found(self, poster_id, image_array):
         """Callback for live updates when a new poster or a better crop is found."""
-        preprocess_options = self.get_preprocess_options()
-        
         if poster_id in self.poster_id_to_button:
             # Update existing poster
             btn = self.poster_id_to_button[poster_id]
@@ -447,12 +425,12 @@ class PosterReaderApp(QWidget):
             
             # Re-queue background tasks
             self.caption_worker.add_task(poster_id, Image.fromarray(rgb_image))
-            self.ocr_worker.add_task(poster_id, image_array, preprocess_options)
+            self.ocr_worker.add_task(poster_id, image_array)
             self.set_button_preview(btn, image_array)
         else:
             initial_text = f"Poster {poster_id+1} detected. Processing..."
             self.add_poster_to_gallery(image_array, initial_text, poster_id=poster_id)
-            self.ocr_worker.add_task(poster_id, image_array, preprocess_options)
+            self.ocr_worker.add_task(poster_id, image_array)
 
     def on_model_finished(self, results, output_path=None):
         self.results_progress_bar.setVisible(False)
@@ -475,43 +453,11 @@ class PosterReaderApp(QWidget):
         layout = QVBoxLayout(page)
 
         self.ocr_result_label = QLabel(
-            "Choose OCR preprocessing options, then press T to load local images. "
+            "Press T to load local images. "
             "Navigate posters with Arrow Keys. Press Enter to open."
         )
         self.ocr_result_label.setWordWrap(True)
         layout.addWidget(self.ocr_result_label)
-
-        preprocess_layout = QHBoxLayout()
-
-        self.chk_grayscale = QCheckBox("Grayscale")
-        self.chk_threshold = QCheckBox("Adaptive Threshold")
-        self.chk_sharpen = QCheckBox("Sharpen")
-        self.chk_median = QCheckBox("Median Filter")
-
-        self.scale_combo = QComboBox()
-        self.scale_combo.addItem("0.5x", 0.5)
-        self.scale_combo.addItem("1x", 1.0)
-        self.scale_combo.addItem("2x", 2.0)
-        self.scale_combo.addItem("4x", 4.0)
-        self.scale_combo.setCurrentIndex(1)
-
-        self.chk_grayscale.stateChanged.connect(self.refresh_gallery_previews)
-        self.chk_threshold.stateChanged.connect(self.refresh_gallery_previews)
-        self.chk_sharpen.stateChanged.connect(self.refresh_gallery_previews)
-        self.chk_median.stateChanged.connect(self.refresh_gallery_previews)
-        self.scale_combo.currentIndexChanged.connect(self.refresh_gallery_previews)
-
-        preprocess_layout.addWidget(QLabel("OCR Preprocessing:"))
-        preprocess_layout.addWidget(self.chk_grayscale)
-        preprocess_layout.addWidget(self.chk_threshold)
-        preprocess_layout.addWidget(self.chk_sharpen)
-        preprocess_layout.addWidget(self.chk_median)
-        preprocess_layout.addWidget(QLabel("Scale:"))
-        preprocess_layout.addWidget(self.scale_combo)
-
-        layout.addLayout(preprocess_layout)
-
-
 
         scroll = QScrollArea()
         self.grid_widget = QWidget()
@@ -560,28 +506,16 @@ class PosterReaderApp(QWidget):
         self.poster_data = []
         self.focused_poster_index = -1
 
-    def get_preprocess_options(self):
-        """Read OCR preprocessing options from the GUI controls."""
-        return {
-            "grayscale": self.chk_grayscale.isChecked(),
-            "threshold": self.chk_threshold.isChecked(),
-            "sharpen": self.chk_sharpen.isChecked(),
-            "median": self.chk_median.isChecked(),
-            "scale": self.scale_combo.currentData(),
-        }
-
     def load_test_posters(self):
         """Manually select images to test the gallery and OCR display."""
         if self.stack.currentIndex() != 2:
             return
         files, _ = QFileDialog.getOpenFileNames(self, "Select Posters", LOAD_POSTERS_START_DIR, "Images (*.png *.jpg *.jpeg)")
 
-        preprocess_options = self.get_preprocess_options()
-
         for file_path in files:
             pid = self.next_poster_id
             self.next_poster_id += 1
-            detected_text, avg_conf = self.ocr_engine.get_text(file_path, preprocess_options)
+            detected_text, avg_conf = self.ocr_engine.get_text(file_path)
             self.add_poster_to_gallery(file_path, detected_text, avg_conf, poster_id=pid)
 
     def add_poster_to_gallery(self, image_input, detected_text, avg_conf=None, poster_id=None):
@@ -743,44 +677,6 @@ class PosterReaderApp(QWidget):
         self.focused_poster_index = idx
         self.poster_buttons[idx].setFocus()
 
-    def make_processed_pixmap(self, image_input):
-        """Create a QPixmap showing the currently selected OCR preprocessing result."""
-        options = self.get_preprocess_options()
-
-        if isinstance(image_input, str):
-            frame = cv2.imread(image_input)
-        else:
-            frame = image_input.copy()
-
-        if frame is None:
-            return QPixmap()
-
-        processed = self.ocr_engine.preprocess_for_ocr(frame, options)
-
-        if len(processed.shape) == 2:
-            h, w = processed.shape
-            q_img = QImage(
-                processed.data,
-                w,
-                h,
-                w,
-                QImage.Format.Format_Grayscale8
-            )
-        else:
-            rgb = cv2.cvtColor(processed, cv2.COLOR_BGR2RGB)
-            h, w, ch = rgb.shape
-            q_img = QImage(
-                rgb.data,
-                w,
-                h,
-                ch * w,
-                QImage.Format.Format_RGB888
-            )
-
-        return QPixmap.fromImage(q_img.copy())
-
-
-
     def move_poster_focus(self, delta):
         """Move focus among poster thumbnails on the results screen."""
         if self.stack.currentIndex() != 2 or not self.poster_buttons:
@@ -823,8 +719,7 @@ class PosterReaderApp(QWidget):
         # Prepare OCR text for the dialog to handle
         ocr_text = text
 
-        processed_pixmap = self.make_processed_pixmap(image_input)
-        self.show_zoom_dialog(pixmap, processed_pixmap, display_text, ocr_text=ocr_text, poster_id=tracking_id)
+        self.show_zoom_dialog(pixmap, display_text, ocr_text=ocr_text, poster_id=tracking_id)
 
     def eventFilter(self, obj, event):
         """Track which poster button has keyboard focus."""
@@ -834,19 +729,6 @@ class PosterReaderApp(QWidget):
             self.focused_poster_index = self.poster_buttons.index(obj)
 
         return super().eventFilter(obj, event)
-
-    def refresh_gallery_previews(self):
-        """Refresh all gallery thumbnails using the current preprocessing options."""
-        if not self.poster_buttons or not self.poster_data:
-            return
-
-        for btn, poster in zip(self.poster_buttons, self.poster_data):
-            self.set_button_preview(btn, poster["image_input"])
-
-        self.ocr_result_label.setText(
-            "Gallery previews updated with current preprocessing options. "
-            "Navigate posters with Arrow Keys. Press Enter to open."
-        )
 
     def set_button_preview(self, btn, image_input):
         """Update one gallery button to show the original image thumbnail."""
@@ -876,39 +758,21 @@ class PosterReaderApp(QWidget):
         btn.setIconSize(thumbnail.size())
         btn.setFixedSize(thumbnail.width() + 8, thumbnail.height() + 8)
 
-    def show_zoom_dialog(self, original_pixmap, processed_pixmap, text, ocr_text=None, poster_id=None):
-        """Opens a dialog with original and preprocessed poster views."""
+    def show_zoom_dialog(self, original_pixmap, text, ocr_text=None, poster_id=None):
+        """Opens a dialog with the original poster view."""
         try:
             dialog = QDialog(self)
-            dialog.setWindowTitle("Poster Viewer — Original vs Preprocessed")
-            dialog.resize(1200, 700)
+            dialog.setWindowTitle("Poster Viewer")
+            dialog.resize(800, 700)
 
             self.active_dialog = dialog
             self.active_dialog_poster_id = poster_id
 
             main_layout = QVBoxLayout(dialog)
-            image_layout = QHBoxLayout()
-            image_layout.setContentsMargins(0, 0, 0, 0)
-
-            left_layout = QVBoxLayout()
-            left_title = QLabel("Original")
-            left_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            left_view = ZoomableImageLabel(original_pixmap, "Original View", dialog)
-            left_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            left_layout.addWidget(left_title)
-            left_layout.addWidget(left_view, stretch=1)
-
-            right_layout = QVBoxLayout()
-            right_title = QLabel("Preprocessed for OCR")
-            right_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            right_view = ZoomableImageLabel(processed_pixmap, "Preprocessed View", dialog)
-            right_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-            right_layout.addWidget(right_title)
-            right_layout.addWidget(right_view, stretch=1)
-
-            image_layout.addLayout(left_layout)
-            image_layout.addLayout(right_layout)
-            main_layout.addLayout(image_layout, stretch=1)
+            
+            image_view = ZoomableImageLabel(original_pixmap, "Original View", dialog)
+            image_view.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            main_layout.addWidget(image_view, stretch=1)
 
             text_label = QLabel(text)
             text_label.setWordWrap(True)
@@ -925,7 +789,7 @@ class PosterReaderApp(QWidget):
             QShortcut(QKeySequence("R"), dialog, activated=lambda: self.speaker.speak(ocr_text))
 
             self.reader_filter.suppress_once = True
-            right_view.setFocus()
+            image_view.setFocus()
             
             # Final OCR narration call - slightly delayed to ensure UI is ready
             if self.screen_reader_enabled and ocr_text:
