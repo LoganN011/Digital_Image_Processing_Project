@@ -29,6 +29,24 @@ DEFAULT_PARSEQ_REPO = "baudm/parseq"
 DEFAULT_PARSEQ_MODEL = "parseq"
 DEFAULT_JOINER = " | "
 DEFAULT_RETRY_INVERT_IF_BLANK = True
+DEFAULT_EASYOCR_DETECT_OPTIONS: dict[str, Any] = {
+    "min_size": 0,
+    "text_threshold": 0.36,
+    "low_text": 0.18,
+    "link_threshold": 0.18,
+    "canvas_size": 1280,
+    "mag_ratio": 1.0,
+    "slope_ths": 0.1,
+    "ycenter_ths": 0.5,
+    "height_ths": 0.0,
+    "width_ths": 0.0,
+    "add_margin": 0.12,
+    "reformat": True,
+    "threshold": 0.0,
+    "bbox_min_score": 0.0,
+    "bbox_min_size": 0,
+    "max_candidates": 0,
+}
 
 
 @dataclass
@@ -60,13 +78,6 @@ def clean_ocr_text(text: str) -> str:
 
 
 def maybe_split_parseq_text(text: str) -> str:
-    """Add likely missing spaces in PARSeq output, without touching URLs/emails/etc.
-
-    PARSeq often recognizes a whole cropped text line as one continuous token
-    even when EasyOCR detected it as a line containing multiple words. This
-    helper is intentionally applied only to PARSeq text, before OCRLine is
-    created, so OCRLine.text and OCRLine.parseq_text stay consistent.
-    """
     text = clean_ocr_text(text)
     if not text or " " in text or len(text) <= 6:
         return text
@@ -216,7 +227,7 @@ class OCREngine:
 
             if not lines:
                 self._progress(callback, "OCR done: no text", 100, stage="done", done=0, total=len(raw))
-                return OCRResult("(no text)", 0.0, "PARSeq+EasyOCR.readtext", [], used_inverted, len(raw))
+                return OCRResult("(no text)", 0.0, "PARSeq+EasyOCR.detect", [], used_inverted, len(raw))
 
             text = str(options.get("joiner", DEFAULT_JOINER)).join(line.text for line in lines)
             avg_conf = float(np.mean([line.conf for line in lines]))
@@ -228,8 +239,8 @@ class OCREngine:
             return OCRResult(f"OCR Error: {exc}", 0.0, "error", [])
 
     def _read_and_parse(self, image: np.ndarray, callback, start: int, end: int, stage: str):
-        self._progress(callback, "EasyOCR readtext: detecting lines", start, stage="easyocr_readtext")
-        raw = self.run_easyocr_readtext(image)
+        self._progress(callback, "EasyOCR detect: finding line boxes", start, stage="easyocr_detect")
+        raw = self.run_easyocr_detect(image)
         total = len(raw or [])
         self._progress(callback, f"PARSeq second pass: 0/{total} lines", start + 10 if total else end, stage=stage, done=0, total=total)
         lines = self.extract_parseq_second_pass_text(raw, image, callback, start + 10, end, stage)
@@ -293,26 +304,71 @@ class OCREngine:
         img_size = tuple(hparams.get("img_size", (32, 128))) if isinstance(hparams, dict) else tuple(getattr(hparams, "img_size", (32, 128)))
         return T.Compose([T.Resize(img_size, interpolation=T.InterpolationMode.BICUBIC), T.ToTensor(), T.Normalize(0.5, 0.5)])
 
-    def run_easyocr_readtext(self, ocr_img: np.ndarray) -> list[Any]:
+    def run_easyocr_detect(self, ocr_img: np.ndarray) -> list[Any]:
         if self.reader is None:
             return []
-        return self.reader.readtext(
-            ocr_img,
-            detail=1,
-            paragraph=False,
-            decoder="greedy",
-            batch_size=1,
-            workers=0,
-            min_size=8,
-            contrast_ths=0.04,
-            adjust_contrast=0.75,
-            text_threshold=0.36,
-            low_text=0.18,
-            link_threshold=0.18,
-            canvas_size=1280,
-            mag_ratio=1.0,
-            add_margin=0.12,
-        )
+        horizontal_list, free_list = self.reader.detect(ocr_img, **DEFAULT_EASYOCR_DETECT_OPTIONS)
+        results: list[Any] = []
+        for box in self._unwrap_easyocr_detection_list(horizontal_list):
+            quad = self._horizontal_box_to_quad(box)
+            if quad is not None:
+                results.append([quad, "", 0.0])
+        for box in self._unwrap_easyocr_detection_list(free_list):
+            quad = self._free_box_to_quad(box)
+            if quad is not None:
+                results.append([quad, "", 0.0])
+        return results
+
+    def run_easyocr_readtext(self, ocr_img: np.ndarray) -> list[Any]:
+        return self.run_easyocr_detect(ocr_img)
+
+    def _unwrap_easyocr_detection_list(self, boxes: Any) -> list[Any]:
+        if boxes is None:
+            return []
+        try:
+            if len(boxes) == 0:
+                return []
+        except Exception:
+            return []
+        if self._looks_like_single_detection_box(boxes):
+            return [boxes]
+        first = boxes[0]
+        if self._looks_like_single_detection_box(first):
+            return list(boxes)
+        try:
+            return list(first)
+        except Exception:
+            return []
+
+    def _looks_like_single_detection_box(self, box: Any) -> bool:
+        try:
+            arr = np.array(box, dtype=np.float32)
+        except Exception:
+            return False
+        if arr.shape == (4, 2):
+            return True
+        return arr.reshape(-1).size == 4
+
+    def _horizontal_box_to_quad(self, box: Any) -> list[list[float]] | None:
+        try:
+            x1, x2, y1, y2 = [float(v) for v in np.array(box, dtype=np.float32).reshape(-1)[:4]]
+        except Exception:
+            return None
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+
+    def _free_box_to_quad(self, box: Any) -> list[list[float]] | None:
+        try:
+            arr = np.array(box, dtype=np.float32).reshape(-1, 2)
+        except Exception:
+            return None
+        if arr.shape[0] < 4:
+            return None
+        arr = arr[:4]
+        if np.ptp(arr[:, 0]) <= 1 or np.ptp(arr[:, 1]) <= 1:
+            return None
+        return arr.astype(float).tolist()
 
     def extract_parseq_second_pass_text(
         self,
@@ -392,7 +448,7 @@ class OCREngine:
         for line in lines:
             if line.method not in methods:
                 methods.append(line.method)
-        return "+".join(methods) if methods else "PARSeq+EasyOCR.readtext"
+        return "+".join(methods) if methods else "PARSeq+EasyOCR.detect"
 
     def preprocess_for_ocr(self, frame: np.ndarray, options: dict[str, Any] | None = None) -> np.ndarray:
         return preprocess_for_ocr(frame)
