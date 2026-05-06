@@ -2,15 +2,9 @@
 """
 easyocr_parseq_qt_lab.py
 
-Standalone PyQt6 tool for experimenting with EasyOCR detect() and PARSeq.
-Shows the EasyOCR detect() defaults/ranges in the GUI.
-
-Usage:
-  python easyocr_parseq_qt_lab.py
-
-Install:
   pip install PyQt6 easyocr torch torchvision pillow opencv-python numpy
   pip install strhub-sdk
+  pip install paddleocr paddlepaddle    # optional, only needed for PaddleOCR detection
 """
 
 from __future__ import annotations
@@ -75,8 +69,21 @@ try:
 except Exception:
     pass
 
+THIS_DIR = Path(__file__).parent    # Start file browse in the directory of this script
+DEFAULT_IMAGE_PATH = Path("/Users/macintosh/UNM/CS591 Digital Image Processing/Final_Project/Code/Utilities/a_poster_sent_to_ocr.png")
+
+PARSEQ_MODEL_OPTIONS = [
+    "parseq",
+    "parseq_tiny",
+    "parseq_patch16_224",
+    "vitstr",
+    "trba",
+    "crnn",
+    "abinet",
+]
+
 EASYOCR_DETECT_OPTION_REFERENCE = [
-    ("min_size", "8", "0–10000 (int)", "Minimum text box size"),
+    ("min_size", "0", "0–10000 (int)", "Minimum text box size"),
     ("text_threshold", "0.36", "0.0–1.0 (float)", "Text confidence threshold"),
     ("low_text", "0.18", "0.0–1.0 (float)", "Lower bound for text confidence"),
     ("link_threshold", "0.18", "0.0–1.0 (float)", "Threshold for linking text boxes"),
@@ -84,16 +91,29 @@ EASYOCR_DETECT_OPTION_REFERENCE = [
     ("mag_ratio", "1.0", "0.1–10.0 (float)", "Magnification ratio for resizing"),
     ("slope_ths", "0.1", "0.0–10.0 (float)", "Slope threshold for merging boxes"),
     ("ycenter_ths", "0.5", "0.0–10.0 (float)", "Y-center threshold for merging boxes"),
-    ("height_ths", "0.5", "0.0–10.0 (float)", "Height threshold for merging boxes"),
-    ("width_ths", "0.5", "0.0–20.0 (float)", "Width threshold for merging boxes"),
+    ("height_ths", "0.0", "0.0–10.0 (float)", "Height threshold for merging boxes"),
+    ("width_ths", "0.0", "0.0–20.0 (float)", "Width threshold for merging boxes"),
     ("add_margin", "0.12", "0.0–10.0 (float)", "Add margin to detected boxes"),
     ("optimal_num_chars", "None", "int or blank", "Expected number of chars per box"),
     ("reformat", "True", "bool (checkbox)", "Reformat output"),
-    ("threshold", "0.2", "0.0–1.0 (float)", "Threshold for binarization/post-processing"),
-    ("bbox_min_score", "0.2", "0.0–1.0 (float)", "Minimum bbox score"),
-    ("bbox_min_size", "3", "0–10000 (int)", "Minimum bbox size"),
+    ("threshold", "0.0", "0.0–1.0 (float)", "Threshold for binarization/post-processing"),
+    ("bbox_min_score", "0.0", "0.0–1.0 (float)", "Minimum bbox score"),
+    ("bbox_min_size", "0", "0–10000 (int)", "Minimum bbox size"),
     ("max_candidates", "0", "0–100000 (int)", "Max candidates; 0 = no limit"),
     ("Extra kwargs", "—", "JSON dict", "Any other supported EasyOCR detect() kwargs"),
+]
+
+PADDLEOCR_DETECT_OPTION_REFERENCE = [
+    ("lang", "en", "str", "PaddleOCR language code"),
+    ("device", "auto", "auto/cpu/gpu", "Device choice for PaddleOCR when supported"),
+    ("use_angle_cls", "False", "bool", "Legacy text-angle classifier flag"),
+    ("det_limit_side_len", "2560", "32–8192 (int)", "Higher resize limit for better small-text detection"),
+    ("det_limit_type", "max", "max/min", "Whether det_limit_side_len limits the long or short side"),
+    ("det_db_thresh", "0.20", "0.0–1.0 (float)", "Lower DB text-map threshold to keep faint/small text candidates"),
+    ("det_db_box_thresh", "0.20", "0.0–1.0 (float)", "Lower DB box confidence threshold to favor recall"),
+    ("det_db_unclip_ratio", "2.0", "0.1–10.0 (float)", "Larger expansion ratio to include more of each text line"),
+    ("Extra init kwargs", '{"model_name": "PP-OCRv5_server_det"}', "JSON dict", "Use the higher-accuracy PaddleOCR server detector"),
+    ("Extra run kwargs", "—", "JSON dict", "Additional detection predict kwargs; recognition stays disabled"),
 ]
 
 
@@ -152,6 +172,256 @@ def preprocess_for_ocr(crop_bgr: np.ndarray) -> np.ndarray:
     gray = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
     blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
     return cv2.addWeighted(gray, 1.45, blur, -0.45, 0)
+
+
+
+def affine_to_homography(matrix: np.ndarray) -> np.ndarray:
+    m = np.asarray(matrix, dtype=np.float32)
+    if m.shape == (2, 3):
+        return np.vstack([m, np.array([0, 0, 1], dtype=np.float32)])
+    if m.shape == (3, 3):
+        return m
+    raise ValueError(f"Expected 2x3 or 3x3 affine matrix, got {m.shape}")
+
+
+def compose_affine(next_matrix: np.ndarray, current_matrix: np.ndarray) -> np.ndarray:
+    composed = affine_to_homography(next_matrix) @ affine_to_homography(current_matrix)
+    return composed[:2].astype(np.float32)
+
+
+def transform_points_affine(points: Any, matrix: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float32).reshape(-1, 2)
+    ones = np.ones((pts.shape[0], 1), dtype=np.float32)
+    hom = np.hstack([pts, ones])
+    mapped = hom @ np.asarray(matrix, dtype=np.float32).T
+    return mapped.reshape(np.asarray(points, dtype=np.float32).shape)
+
+
+def resize_with_matrix(image: np.ndarray, scale: float) -> tuple[np.ndarray, np.ndarray]:
+    scale = float(scale)
+    if abs(scale - 1.0) < 1e-6:
+        return image.copy(), np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    h, w = image.shape[:2]
+    new_w = max(1, int(round(w * scale)))
+    new_h = max(1, int(round(h * scale)))
+    interp = cv2.INTER_CUBIC if scale > 1.0 else cv2.INTER_AREA
+    resized = cv2.resize(image, (new_w, new_h), interpolation=interp)
+    matrix = np.array([[scale, 0, 0], [0, scale, 0]], dtype=np.float32)
+    return resized, matrix
+
+
+def rotate_bound_with_matrix(image: np.ndarray, angle_degrees: float) -> tuple[np.ndarray, np.ndarray]:
+    angle_degrees = float(angle_degrees)
+    if abs(angle_degrees) < 1e-6:
+        return image.copy(), np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+
+    h, w = image.shape[:2]
+    center = (w / 2.0, h / 2.0)
+    matrix = cv2.getRotationMatrix2D(center, angle_degrees, 1.0).astype(np.float32)
+    cos = abs(matrix[0, 0])
+    sin = abs(matrix[0, 1])
+    new_w = int(round((h * sin) + (w * cos)))
+    new_h = int(round((h * cos) + (w * sin)))
+    matrix[0, 2] += (new_w / 2.0) - center[0]
+    matrix[1, 2] += (new_h / 2.0) - center[1]
+    rotated = cv2.warpAffine(
+        image,
+        matrix,
+        (new_w, new_h),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return rotated, matrix
+
+
+def estimate_text_angle_degrees(image: np.ndarray) -> float:
+    if image is None or image.size == 0:
+        return 0.0
+    if image.ndim == 2:
+        gray = image.copy()
+    elif image.ndim == 3 and image.shape[2] == 4:
+        gray = cv2.cvtColor(cv2.cvtColor(image, cv2.COLOR_BGRA2BGR), cv2.COLOR_BGR2GRAY)
+    else:
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+    long_side = max(gray.shape[:2])
+    if long_side > 1200:
+        scale = 1200.0 / long_side
+        gray_small = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    else:
+        gray_small = gray
+
+    gray_small = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray_small)
+    edges = cv2.Canny(gray_small, 50, 150, apertureSize=3)
+    min_len = max(20, int(0.08 * min(gray_small.shape[:2])))
+    lines = cv2.HoughLinesP(
+        edges,
+        rho=1,
+        theta=np.pi / 180.0,
+        threshold=max(20, int(0.02 * min(gray_small.shape[:2]))),
+        minLineLength=min_len,
+        maxLineGap=max(6, int(0.02 * min(gray_small.shape[:2]))),
+    )
+    angles: list[float] = []
+    if lines is not None:
+        for line in lines.reshape(-1, 4):
+            x1, y1, x2, y2 = line.astype(float)
+            dx = x2 - x1
+            dy = y2 - y1
+            length = math.hypot(dx, dy)
+            if length < min_len:
+                continue
+            angle = math.degrees(math.atan2(dy, dx))
+            while angle <= -90:
+                angle += 180
+            while angle > 90:
+                angle -= 180
+            if -35 <= angle <= 35:
+                angles.append(angle)
+
+    if angles:
+        return float(np.median(np.array(angles, dtype=np.float32)))
+
+    # Fallback: estimate orientation from connected foreground pixels.
+    try:
+        blur = cv2.GaussianBlur(gray_small, (3, 3), 0)
+        _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        if np.mean(th) > 127:
+            th = 255 - th
+        coords = np.column_stack(np.where(th > 0))
+        if coords.shape[0] < 25:
+            return 0.0
+        rect = cv2.minAreaRect(coords[:, ::-1].astype(np.float32))
+        angle = float(rect[-1])
+        if angle < -45:
+            angle += 90
+        if angle > 45:
+            angle -= 90
+        if -35 <= angle <= 35:
+            return angle
+    except Exception:
+        pass
+
+    return 0.0
+
+
+def preprocess_for_ocr_with_matrix(crop_bgr: np.ndarray, allow_internal_resize: bool = True) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    steps: list[str] = []
+    matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    if crop_bgr is None or crop_bgr.size == 0:
+        return crop_bgr, matrix, steps
+
+    if crop_bgr.ndim == 2:
+        gray = crop_bgr.copy()
+    elif crop_bgr.ndim == 3 and crop_bgr.shape[2] == 4:
+        gray = cv2.cvtColor(cv2.cvtColor(crop_bgr, cv2.COLOR_BGRA2BGR), cv2.COLOR_BGR2GRAY)
+    else:
+        gray = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
+    steps.append("grayscale")
+
+    if allow_internal_resize:
+        long_side = max(gray.shape[:2])
+        if long_side < 900:
+            scale = min(2.4, 900.0 / max(1, long_side))
+            gray, sm = resize_with_matrix(gray, scale)
+            matrix = compose_affine(sm, matrix)
+            steps.append(f"auto resize {scale:.2f}x")
+        elif long_side > 1800:
+            scale = 1800.0 / long_side
+            gray, sm = resize_with_matrix(gray, scale)
+            matrix = compose_affine(sm, matrix)
+            steps.append(f"auto resize {scale:.2f}x")
+
+    gray = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
+    blur = cv2.GaussianBlur(gray, (0, 0), sigmaX=1.0)
+    out = cv2.addWeighted(gray, 1.45, blur, -0.45, 0)
+    steps.append("CLAHE + sharpen")
+    return out, matrix, steps
+
+
+def parse_scale_choice(text: str) -> float:
+    raw = str(text or "1.0x").strip().lower().replace("×", "x").replace("x", "")
+    try:
+        return max(1.0, float(raw))
+    except Exception:
+        return 1.0
+
+
+def build_detection_preprocess_image(
+    frame: np.ndarray,
+    use_ocr_preprocess: bool,
+    upsample_enabled: bool,
+    upsample_scale: float,
+    horizontalize_enabled: bool,
+    horizontalize_auto: bool,
+    manual_angle: float,
+) -> tuple[np.ndarray, np.ndarray, list[str]]:
+    if frame is None or frame.size == 0:
+        raise ValueError("No source image loaded.")
+
+    image = frame.copy()
+    matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+    steps: list[str] = []
+
+    if horizontalize_enabled:
+        if horizontalize_auto:
+            estimated = estimate_text_angle_degrees(image)
+            rotate_angle = -estimated
+            steps.append(f"horizontalize auto estimated {estimated:+.2f}° / rotated {rotate_angle:+.2f}°")
+        else:
+            rotate_angle = float(manual_angle)
+            steps.append(f"horizontalize manual rotate {rotate_angle:+.2f}°")
+        image, rm = rotate_bound_with_matrix(image, rotate_angle)
+        matrix = compose_affine(rm, matrix)
+
+    if upsample_enabled:
+        scale = max(1.0, float(upsample_scale))
+        if scale > 1.0:
+            image, sm = resize_with_matrix(image, scale)
+            matrix = compose_affine(sm, matrix)
+            steps.append(f"upsample {scale:.2f}x")
+
+    if use_ocr_preprocess:
+        # If the user explicitly upsamples, do not undo it with the old 1800-px cap.
+        allow_internal_resize = not (upsample_enabled and float(upsample_scale) > 1.0)
+        image, pm, pre_steps = preprocess_for_ocr_with_matrix(image, allow_internal_resize=allow_internal_resize)
+        matrix = compose_affine(pm, matrix)
+        steps.extend(pre_steps)
+
+    return image, matrix, steps
+
+def ensure_paddleocr_compatible_image(image: np.ndarray) -> np.ndarray:
+    """Return a contiguous uint8 3-channel image for PaddleOCR detection.
+
+    PaddleOCR's detector expects H x W x C image input. The lab's standalone
+    preprocessing intentionally returns a 2D grayscale image, which can trigger
+    errors like: "not enough values to unpack (expected 3, got 2)".
+    """
+    if image is None or image.size == 0:
+        raise ValueError("Empty image passed to PaddleOCR detector.")
+
+    arr = image
+    if arr.dtype != np.uint8:
+        arr = np.asarray(arr)
+        if np.issubdtype(arr.dtype, np.floating):
+            if arr.max(initial=0) <= 1.0:
+                arr = arr * 255.0
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+        else:
+            arr = np.clip(arr, 0, 255).astype(np.uint8)
+
+    if arr.ndim == 2:
+        arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
+    elif arr.ndim == 3 and arr.shape[2] == 1:
+        arr = cv2.cvtColor(arr[:, :, 0], cv2.COLOR_GRAY2BGR)
+    elif arr.ndim == 3 and arr.shape[2] == 4:
+        arr = cv2.cvtColor(arr, cv2.COLOR_BGRA2BGR)
+    elif arr.ndim == 3 and arr.shape[2] == 3:
+        arr = arr.copy()
+    else:
+        raise ValueError(f"Unsupported image shape for PaddleOCR detector: {arr.shape}")
+
+    return np.ascontiguousarray(arr)
 
 
 def crop_easyocr_text_region(image: np.ndarray, pts: Any, pad: int = 3) -> np.ndarray | None:
@@ -222,6 +492,146 @@ def normalize_detect_output(out: Any) -> tuple[list[Any], list[Any]]:
     return list(horizontal or []), list(free or [])
 
 
+def as_quad_points(obj: Any) -> np.ndarray | None:
+    try:
+        arr = np.array(obj, dtype=np.float32)
+    except Exception:
+        return None
+    if arr.shape == (4, 2) and np.isfinite(arr).all():
+        return arr
+    if arr.shape == (8,) and np.isfinite(arr).all():
+        return arr.reshape(4, 2)
+    return None
+
+
+def normalize_paddleocr_detection_output(out: Any) -> list[np.ndarray]:
+    """
+    Extract text-detection polygons from PaddleOCR outputs across v2/v3 APIs.
+
+    Supported examples:
+      - PaddleOCR 3.x Result objects from ocr.predict(...), whose .json often wraps data under "res"
+      - PaddleOCR 3.x dicts containing dt_polys
+      - PaddleOCR 2.x ocr(..., det=True, rec=False) nested list output
+      - Raw numpy arrays/lists shaped like (N, 4, 2), (4, 2), or (8,)
+    """
+    if out is None:
+        return []
+
+    boxes: list[np.ndarray] = []
+    visited: set[int] = set()
+
+    def walk(obj: Any):
+        if obj is None:
+            return
+
+        oid = id(obj)
+        if oid in visited:
+            return
+        visited.add(oid)
+
+        # PaddleOCR 3.x Result object: result.json is usually a dict like {"res": {...}}
+        for attr in ("json", "res", "result"):
+            if hasattr(obj, attr):
+                try:
+                    walk(getattr(obj, attr))
+                    return
+                except Exception:
+                    pass
+
+        if hasattr(obj, "to_dict"):
+            try:
+                walk(obj.to_dict())
+                return
+            except Exception:
+                pass
+
+        if isinstance(obj, np.ndarray):
+            if obj.ndim == 3 and obj.shape[1:] == (4, 2):
+                for item in obj:
+                    quad = as_quad_points(item)
+                    if quad is not None:
+                        boxes.append(quad)
+                return
+            if obj.ndim == 2 and obj.shape[1] == 8:
+                for item in obj:
+                    quad = as_quad_points(item)
+                    if quad is not None:
+                        boxes.append(quad)
+                return
+            quad = as_quad_points(obj)
+            if quad is not None:
+                boxes.append(quad)
+                return
+
+        if isinstance(obj, dict):
+            preferred_keys = (
+                "dt_polys", "dt_boxes", "det_polys", "text_polys",
+                "rec_polys", "polys", "boxes", "points",
+            )
+            found_preferred = False
+            for key in preferred_keys:
+                if key in obj:
+                    found_preferred = True
+                    walk(obj[key])
+            if found_preferred:
+                return
+            # Many PaddleOCR 3.x results are wrapped as {"res": {...}}.
+            for value in obj.values():
+                walk(value)
+            return
+
+        if isinstance(obj, (list, tuple)):
+            if len(obj) == 0:
+                return
+            quad = as_quad_points(obj)
+            if quad is not None:
+                boxes.append(quad)
+                return
+
+            # PaddleOCR 2.x detection-only result can be [[box1, box2, ...]].
+            # Full OCR result can be [[box, (text, score)], ...]; take the first item.
+            if len(obj) == 2:
+                first_quad = as_quad_points(obj[0])
+                if first_quad is not None:
+                    boxes.append(first_quad)
+                    return
+
+            for item in obj:
+                walk(item)
+
+    walk(out)
+
+    unique: list[np.ndarray] = []
+    seen: set[tuple[int, ...]] = set()
+    for box in boxes:
+        if box.shape != (4, 2) or not np.isfinite(box).all():
+            continue
+        key = tuple(np.round(box.reshape(-1), 1).astype(int).tolist())
+        if key not in seen:
+            seen.add(key)
+            unique.append(box.astype(np.float32))
+    return unique
+
+
+def describe_paddle_output(out: Any) -> str:
+    try:
+        if isinstance(out, list):
+            return f"list(len={len(out)}, first={type(out[0]).__name__ if out else 'empty'})"
+        if isinstance(out, tuple):
+            return f"tuple(len={len(out)}, first={type(out[0]).__name__ if out else 'empty'})"
+        if isinstance(out, dict):
+            return f"dict(keys={list(out.keys())[:8]})"
+        if isinstance(out, np.ndarray):
+            return f"ndarray(shape={out.shape}, dtype={out.dtype})"
+        if hasattr(out, "json"):
+            j = getattr(out, "json")
+            if isinstance(j, dict):
+                return f"{type(out).__name__}(json_keys={list(j.keys())[:8]})"
+            return f"{type(out).__name__}(json={type(j).__name__})"
+        return type(out).__name__
+    except Exception:
+        return type(out).__name__
+
 def cv_to_qpixmap(img: np.ndarray, max_w: int | None = None, max_h: int | None = None) -> QPixmap:
     if img is None or img.size == 0:
         img = np.zeros((32, 128, 3), dtype=np.uint8)
@@ -257,6 +667,267 @@ def supported_kwargs(callable_obj, kwargs: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in kwargs.items() if k in allowed}
 
 
+class PaddleOCRDetectorRunner:
+    def __init__(
+        self,
+        lang: str,
+        device_choice: str,
+        use_angle_cls: bool,
+        init_kwargs: dict[str, Any],
+    ):
+        try:
+            import paddleocr as paddleocr_pkg
+        except Exception as exc:
+            raise RuntimeError(
+                "PaddleOCR is not installed. Install it with: pip install paddleocr paddlepaddle"
+            ) from exc
+
+        self.ocr = None
+        self.text_detector = None
+        self.backend = ""
+        self.api_mode = ""
+
+        lang = (lang or "en").strip() or "en"
+        extra = dict(init_kwargs or {})
+
+        det_limit_side_len = int(extra.pop("det_limit_side_len", extra.pop("text_det_limit_side_len", extra.pop("limit_side_len", 1280))))
+        det_limit_type = str(extra.pop("det_limit_type", extra.pop("text_det_limit_type", extra.pop("limit_type", "max"))))
+        det_thresh = float(extra.pop("det_db_thresh", extra.pop("text_det_thresh", extra.pop("thresh", 0.3))))
+        det_box_thresh = float(extra.pop("det_db_box_thresh", extra.pop("text_det_box_thresh", extra.pop("box_thresh", 0.3))))
+        det_unclip_ratio = float(extra.pop("det_db_unclip_ratio", extra.pop("text_det_unclip_ratio", extra.pop("unclip_ratio", 1.5))))
+
+        device_value: str | None = None
+        if device_choice == "gpu":
+            device_value = "gpu:0"
+        elif device_choice == "cpu":
+            device_value = "cpu"
+
+        # Preferred PaddleOCR 3.x path: the standalone TextDetection module.
+        # This avoids running recognition at all; PARSeq remains the recognizer.
+        TextDetection = getattr(paddleocr_pkg, "TextDetection", None)
+        if TextDetection is not None:
+            td_extra = dict(extra)
+            model_name = td_extra.pop("model_name", td_extra.pop("text_detection_model_name", "PP-OCRv5_server_det"))
+            td_kwargs: dict[str, Any] = {
+                "model_name": model_name,
+                "limit_side_len": det_limit_side_len,
+                "limit_type": det_limit_type,
+                "thresh": det_thresh,
+                "box_thresh": det_box_thresh,
+                "unclip_ratio": det_unclip_ratio,
+            }
+            if device_value is not None:
+                td_kwargs["device"] = device_value
+            td_kwargs.update(td_extra)
+
+            try:
+                self.text_detector = TextDetection(**td_kwargs)
+                self.init_kwargs = td_kwargs
+                self.backend = "TextDetection"
+                self.api_mode = "text_detection"
+                self.default_predict_kwargs = {
+                    "batch_size": 1,
+                    "limit_side_len": det_limit_side_len,
+                    "limit_type": det_limit_type,
+                    "thresh": det_thresh,
+                    "box_thresh": det_box_thresh,
+                    "unclip_ratio": det_unclip_ratio,
+                }
+                return
+            except Exception as exc:
+                self.text_detector = None
+                last_text_detection_exc = exc
+        else:
+            last_text_detection_exc = RuntimeError("paddleocr.TextDetection is unavailable in this PaddleOCR version")
+
+        PaddleOCR = getattr(paddleocr_pkg, "PaddleOCR", None)
+        if PaddleOCR is None:
+            raise RuntimeError(f"Could not initialize PaddleOCR TextDetection fallback: {last_text_detection_exc}")
+
+        # Fallback: PaddleOCR pipeline API. This is more compatible, but may run extra OCR stages.
+        # Keep it because older PaddleOCR wheels do not expose TextDetection.
+        pipeline_extra = dict(extra)
+        modern_base: dict[str, Any] = {
+            "lang": lang,
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": bool(use_angle_cls),
+            "text_det_limit_side_len": det_limit_side_len,
+            "text_det_limit_type": det_limit_type,
+            "text_det_thresh": det_thresh,
+            "text_det_box_thresh": det_box_thresh,
+            "text_det_unclip_ratio": det_unclip_ratio,
+        }
+        if device_value is not None:
+            modern_base["device"] = device_value
+        modern_base.update(pipeline_extra)
+
+        legacy_base: dict[str, Any] = {
+            "lang": lang,
+            "use_angle_cls": bool(use_angle_cls),
+            "det_limit_side_len": det_limit_side_len,
+            "det_limit_type": det_limit_type,
+            "det_db_thresh": det_thresh,
+            "det_db_box_thresh": det_box_thresh,
+            "det_db_unclip_ratio": det_unclip_ratio,
+        }
+        if device_choice == "gpu":
+            legacy_base["use_gpu"] = True
+        elif device_choice == "cpu":
+            legacy_base["use_gpu"] = False
+        legacy_base.update(pipeline_extra)
+
+        candidates: list[tuple[str, dict[str, Any]]] = [
+            ("modern_pipeline", dict(modern_base)),
+            ("legacy_pipeline", dict(legacy_base)),
+            ("minimal_pipeline", {"lang": lang}),
+        ]
+
+        last_exc: Exception | None = last_text_detection_exc
+        for api_mode, kwargs in candidates:
+            try:
+                self.ocr = PaddleOCR(**kwargs)
+                self.init_kwargs = kwargs
+                self.backend = "PaddleOCR"
+                self.api_mode = api_mode
+                self.default_predict_kwargs = {
+                    "use_doc_orientation_classify": False,
+                    "use_doc_unwarping": False,
+                    "use_textline_orientation": bool(use_angle_cls),
+                    "text_det_limit_side_len": det_limit_side_len,
+                    "text_det_limit_type": det_limit_type,
+                    "text_det_thresh": det_thresh,
+                    "text_det_box_thresh": det_box_thresh,
+                    "text_det_unclip_ratio": det_unclip_ratio,
+                }
+                return
+            except TypeError as exc:
+                last_exc = exc
+                continue
+            except Exception as exc:
+                last_exc = exc
+                continue
+        raise RuntimeError(f"Could not initialize PaddleOCR detector. TextDetection error: {last_text_detection_exc}; PaddleOCR error: {last_exc}")
+
+    def detect(self, image: np.ndarray, run_kwargs: dict[str, Any]) -> tuple[list[np.ndarray], str]:
+        clean_kwargs = self._clean_run_kwargs(run_kwargs)
+        errors: list[str] = []
+
+        if self.text_detector is not None:
+            predict_kwargs = dict(self.default_predict_kwargs)
+            predict_kwargs.update(self._to_text_detection_kwargs(clean_kwargs))
+            try:
+                try:
+                    out = self.text_detector.predict(input=image, **predict_kwargs)
+                except TypeError:
+                    out = self.text_detector.predict(image, **predict_kwargs)
+                boxes = normalize_paddleocr_detection_output(out)
+                return boxes, f"TextDetection.predict output: {describe_paddle_output(out)}"
+            except Exception as exc:
+                errors.append(f"TextDetection.predict() failed: {exc}")
+
+        # PaddleOCR 3.x pipeline path. predict(input=np.ndarray, ...) returns Result objects
+        # containing dt_polys. This avoids the older ocr(..., det=True, rec=False) path that can
+        # throw tuple/list index errors with newer PaddleOCR releases.
+        if self.ocr is not None and hasattr(self.ocr, "predict"):
+            predict_kwargs = dict(self.default_predict_kwargs)
+            predict_kwargs.update(self._to_pipeline_predict_kwargs(clean_kwargs))
+            try:
+                try:
+                    out = self.ocr.predict(input=image, **predict_kwargs)
+                except TypeError:
+                    out = self.ocr.predict(image, **predict_kwargs)
+                boxes = normalize_paddleocr_detection_output(out)
+                return boxes, f"PaddleOCR.predict output: {describe_paddle_output(out)}"
+            except Exception as exc:
+                errors.append(f"PaddleOCR.predict() failed: {exc}")
+
+        # Fallback for PaddleOCR 2.x.
+        if self.ocr is not None and hasattr(self.ocr, "ocr"):
+            old_kwargs = {
+                k: v for k, v in clean_kwargs.items()
+                if k not in (
+                    "use_doc_orientation_classify", "use_doc_unwarping", "use_textline_orientation",
+                    "text_det_limit_side_len", "text_det_limit_type", "text_det_thresh",
+                    "text_det_box_thresh", "text_det_unclip_ratio", "text_rec_score_thresh",
+                    "limit_side_len", "limit_type", "thresh", "box_thresh", "unclip_ratio",
+                )
+            }
+            try:
+                out = self.ocr.ocr(image, det=True, rec=False, cls=False, **old_kwargs)
+                boxes = normalize_paddleocr_detection_output(out)
+                return boxes, f"ocr(det=True, rec=False) output: {describe_paddle_output(out)}"
+            except Exception as exc:
+                errors.append(f"ocr(det=True, rec=False) failed: {exc}")
+
+            # Some old builds prefer image paths rather than ndarray input. Use a temporary PNG.
+            try:
+                import tempfile
+                tmp_path = None
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                    tmp_path = f.name
+                cv2.imwrite(tmp_path, image)
+                try:
+                    out = self.ocr.ocr(tmp_path, det=True, rec=False, cls=False, **old_kwargs)
+                finally:
+                    try:
+                        Path(tmp_path).unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                boxes = normalize_paddleocr_detection_output(out)
+                return boxes, f"ocr(temp_path, det=True, rec=False) output: {describe_paddle_output(out)}"
+            except Exception as exc:
+                errors.append(f"ocr(temp_path, det=True, rec=False) failed: {exc}")
+
+        raise RuntimeError("PaddleOCR detection failed:\n" + "\n".join(errors))
+
+    def _clean_run_kwargs(self, run_kwargs: dict[str, Any]) -> dict[str, Any]:
+        clean = dict(run_kwargs or {})
+        # Recognition is intentionally not run here; PARSeq handles recognition.
+        for key in ("det", "rec", "cls"):
+            clean.pop(key, None)
+        return clean
+
+    def _to_text_detection_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        clean = dict(kwargs)
+        translations = {
+            "det_limit_side_len": "limit_side_len",
+            "text_det_limit_side_len": "limit_side_len",
+            "det_limit_type": "limit_type",
+            "text_det_limit_type": "limit_type",
+            "det_db_thresh": "thresh",
+            "text_det_thresh": "thresh",
+            "det_db_box_thresh": "box_thresh",
+            "text_det_box_thresh": "box_thresh",
+            "det_db_unclip_ratio": "unclip_ratio",
+            "text_det_unclip_ratio": "unclip_ratio",
+        }
+        for old, new in translations.items():
+            if old in clean and new not in clean:
+                clean[new] = clean.pop(old)
+        for key in ("use_doc_orientation_classify", "use_doc_unwarping", "use_textline_orientation", "text_rec_score_thresh"):
+            clean.pop(key, None)
+        return clean
+
+    def _to_pipeline_predict_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any]:
+        clean = dict(kwargs)
+        translations = {
+            "det_limit_side_len": "text_det_limit_side_len",
+            "limit_side_len": "text_det_limit_side_len",
+            "det_limit_type": "text_det_limit_type",
+            "limit_type": "text_det_limit_type",
+            "det_db_thresh": "text_det_thresh",
+            "thresh": "text_det_thresh",
+            "det_db_box_thresh": "text_det_box_thresh",
+            "box_thresh": "text_det_box_thresh",
+            "det_db_unclip_ratio": "text_det_unclip_ratio",
+            "unclip_ratio": "text_det_unclip_ratio",
+        }
+        for old, new in translations.items():
+            if old in clean and new not in clean:
+                clean[new] = clean.pop(old)
+        return clean
+
 class PARSeqRunner:
     def __init__(
         self,
@@ -272,6 +943,8 @@ class PARSeqRunner:
         normalize_mean: float,
         normalize_std: float,
     ):
+        self.repo = repo
+        self.model_name = model_name
         self.device = self.choose_device(device_choice)
         hub_kwargs = dict(hub_extra_kwargs)
         hub_kwargs.setdefault("pretrained", True)
@@ -368,11 +1041,14 @@ class PARSeqRunner:
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("EasyOCR Detect + PARSeq Lab")
+        self.setWindowTitle("Text Detection + PARSeq Lab")
         self.resize(1500, 920)
         self.frame: np.ndarray | None = None
         self.detect_img: np.ndarray | None = None
+        self.frame_to_detect_matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        self.detect_to_frame_matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
         self.reader: easyocr.Reader | None = None
+        self.paddleocr_detector: PaddleOCRDetectorRunner | None = None
         self.parseq: PARSeqRunner | None = None
         self.crops: list[DetectedCrop] = []
         self.undo_stack: list[dict[str, Any]] = []
@@ -384,8 +1060,10 @@ class MainWindow(QMainWindow):
         self.apply_detect_tooltips()
         self.snapshot_options(clear_redo=True)
         self.connect_option_undo_signals()
+        self.connect_auto_reload_signals()
         QShortcut(QKeySequence.StandardKey.Undo, self, activated=self.undo_options)
         QShortcut(QKeySequence.StandardKey.Redo, self, activated=self.redo_options)
+        self.load_default_image_if_available()
 
     def build_ui(self):
         root = QWidget()
@@ -411,9 +1089,9 @@ class MainWindow(QMainWindow):
         actions_layout = QGridLayout(actions_group)
         self.browse_btn = QPushButton("Browse Image")
         self.browse_btn.clicked.connect(self.browse_image)
-        self.reload_reader_btn = QPushButton("Reload EasyOCR")
-        self.reload_reader_btn.clicked.connect(self.reload_reader)
-        self.detect_btn = QPushButton("Run EasyOCR detect()")
+        self.reload_reader_btn = QPushButton("Reload Detector")
+        self.reload_reader_btn.clicked.connect(self.reload_detector)
+        self.detect_btn = QPushButton("Run Text Detection")
         self.detect_btn.clicked.connect(self.run_detect)
         self.reload_parseq_btn = QPushButton("Reload PARSeq")
         self.reload_parseq_btn.clicked.connect(self.reload_parseq)
@@ -438,6 +1116,7 @@ class MainWindow(QMainWindow):
 
         self.build_image_reader_tab()
         self.build_easyocr_detect_tab()
+        self.build_paddleocr_detect_tab()
         self.build_detect_reference_tab()
         self.build_crop_tab()
         self.build_parseq_tab()
@@ -453,7 +1132,7 @@ class MainWindow(QMainWindow):
         self.status.setFixedHeight(125)
         right_layout.addWidget(self.status)
 
-        crops_group = QGroupBox("EasyOCR detect() Crops")
+        crops_group = QGroupBox("Detected Text Crops")
         crops_layout = QVBoxLayout(crops_group)
         self.crop_scroll = QScrollArea()
         self.crop_scroll.setWidgetResizable(True)
@@ -475,14 +1154,43 @@ class MainWindow(QMainWindow):
 
         image_group = QGroupBox("Image")
         image_form = QFormLayout(image_group)
-        self.image_path = QLineEdit()
+        self.image_path = QLineEdit(str(DEFAULT_IMAGE_PATH))
         image_form.addRow("Image path", self.image_path)
-        self.preprocess_check = QCheckBox("Use standalone preprocessing before EasyOCR detect")
+        self.preprocess_check = QCheckBox("Use standalone preprocessing before text detection")
         self.preprocess_check.setChecked(True)
         image_form.addRow(self.preprocess_check)
+
+        self.upsample_check = QCheckBox("Upsample before detection")
+        self.upsample_check.setChecked(False)
+        self.upsample_scale = QComboBox()
+        self.upsample_scale.addItems(["1.25x", "1.5x", "2.0x", "3.0x", "4.0x"])
+        self.upsample_scale.setCurrentText("2.0x")
+        image_form.addRow(self.upsample_check)
+        image_form.addRow("Upsample size", self.upsample_scale)
+
+        self.horizontalize_check = QCheckBox("Horizontalize / deskew text before detection")
+        self.horizontalize_check.setChecked(False)
+        self.horizontalize_auto_check = QCheckBox("Auto-estimate horizontalize angle")
+        self.horizontalize_auto_check.setChecked(True)
+        self.horizontalize_angle = self.spin_float(-45.0, 45.0, 0.0, 0.25)
+        image_form.addRow(self.horizontalize_check)
+        image_form.addRow(self.horizontalize_auto_check)
+        image_form.addRow("Manual rotate angle", self.horizontalize_angle)
+
+        preview_note = QLabel("When preprocessing/upsampling/horizontalizing is enabled, the top preview shows the processed detection image.")
+        preview_note.setWordWrap(True)
+        image_form.addRow(preview_note)
         layout.addWidget(image_group)
 
-        reader_group = QGroupBox("EasyOCR Reader")
+        detector_group = QGroupBox("Text Detection Engine")
+        detector_form = QFormLayout(detector_group)
+        self.detector_engine = QComboBox()
+        self.detector_engine.addItems(["EasyOCR / CRAFT", "PaddleOCR detector"])
+        self.detector_engine.setCurrentText("PaddleOCR detector")
+        detector_form.addRow("Detector", self.detector_engine)
+        layout.addWidget(detector_group)
+
+        reader_group = QGroupBox("EasyOCR / CRAFT detector")
         reader_form = QFormLayout(reader_group)
         self.langs_edit = QLineEdit("en")
         self.gpu_check = QCheckBox("Use GPU for EasyOCR")
@@ -492,13 +1200,13 @@ class MainWindow(QMainWindow):
         layout.addWidget(reader_group)
         layout.addStretch(1)
 
-        self.tabs.addTab(tab, "Image / Reader")
+        self.tabs.addTab(tab, "Image / Detector")
 
     def build_easyocr_detect_tab(self):
         tab = QWidget()
         form = QFormLayout(tab)
 
-        self.min_size = self.spin_int(0, 10000, 8)
+        self.min_size = self.spin_int(0, 10000, 0)
         self.text_threshold = self.spin_float(0.0, 1.0, 0.36, 0.01)
         self.low_text = self.spin_float(0.0, 1.0, 0.18, 0.01)
         self.link_threshold = self.spin_float(0.0, 1.0, 0.18, 0.01)
@@ -506,15 +1214,15 @@ class MainWindow(QMainWindow):
         self.mag_ratio = self.spin_float(0.1, 10.0, 1.0, 0.1)
         self.slope_ths = self.spin_float(0.0, 10.0, 0.1, 0.05)
         self.ycenter_ths = self.spin_float(0.0, 10.0, 0.5, 0.05)
-        self.height_ths = self.spin_float(0.0, 10.0, 0.5, 0.05)
-        self.width_ths = self.spin_float(0.0, 20.0, 0.5, 0.05)
+        self.height_ths = self.spin_float(0.0, 10.0, 0.0, 0.05)
+        self.width_ths = self.spin_float(0.0, 20.0, 0.0, 0.05)
         self.add_margin = self.spin_float(0.0, 10.0, 0.12, 0.01)
         self.optimal_num_chars = QLineEdit("")
         self.reformat_check = QCheckBox("reformat")
         self.reformat_check.setChecked(True)
-        self.threshold = self.spin_float(0.0, 1.0, 0.2, 0.01)
-        self.bbox_min_score = self.spin_float(0.0, 1.0, 0.2, 0.01)
-        self.bbox_min_size = self.spin_int(0, 10000, 3)
+        self.threshold = self.spin_float(0.0, 1.0, 0.0, 0.01)
+        self.bbox_min_score = self.spin_float(0.0, 1.0, 0.0, 0.01)
+        self.bbox_min_size = self.spin_int(0, 10000, 0)
         self.max_candidates = self.spin_int(0, 100000, 0)
         self.detect_extra_json = QTextEdit()
         self.detect_extra_json.setPlaceholderText('Optional JSON, for example: {"poly": false}')
@@ -541,14 +1249,60 @@ class MainWindow(QMainWindow):
 
         self.tabs.addTab(tab, "EasyOCR detect()")
 
+    def build_paddleocr_detect_tab(self):
+        tab = QWidget()
+        form = QFormLayout(tab)
+
+        self.paddle_lang = QLineEdit("en")
+        self.paddle_device = QComboBox()
+        self.paddle_device.addItems(["auto", "cpu", "gpu"])
+        self.paddle_use_angle_cls = QCheckBox("use_angle_cls")
+        self.paddle_use_angle_cls.setChecked(False)
+        self.paddle_det_limit_side_len = self.spin_int(32, 8192, 2560)
+        self.paddle_det_limit_type = QComboBox()
+        self.paddle_det_limit_type.addItems(["max", "min"])
+        self.paddle_det_db_thresh = self.spin_float(0.0, 1.0, 0.20, 0.01)
+        self.paddle_det_db_box_thresh = self.spin_float(0.0, 1.0, 0.20, 0.01)
+        self.paddle_det_db_unclip_ratio = self.spin_float(0.1, 10.0, 2.0, 0.1)
+        self.paddle_init_extra_json = QTextEdit()
+        self.paddle_init_extra_json.setPlainText(json.dumps({"model_name": "PP-OCRv5_server_det"}, indent=2))
+        self.paddle_init_extra_json.setPlaceholderText('Optional PaddleOCR/TextDetection constructor JSON, for example: {"model_name": "PP-OCRv5_server_det"}')
+        self.paddle_init_extra_json.setFixedHeight(95)
+        self.paddle_run_extra_json = QTextEdit()
+        self.paddle_run_extra_json.setPlaceholderText('Optional detection predict JSON. Usually leave blank because PARSeq handles recognition.')
+        self.paddle_run_extra_json.setFixedHeight(70)
+
+        form.addRow("lang", self.paddle_lang)
+        form.addRow("device", self.paddle_device)
+        form.addRow(self.paddle_use_angle_cls)
+        form.addRow("det_limit_side_len", self.paddle_det_limit_side_len)
+        form.addRow("det_limit_type", self.paddle_det_limit_type)
+        form.addRow("det_db_thresh", self.paddle_det_db_thresh)
+        form.addRow("det_db_box_thresh", self.paddle_det_db_box_thresh)
+        form.addRow("det_db_unclip_ratio", self.paddle_det_db_unclip_ratio)
+        form.addRow("Extra PaddleOCR init kwargs JSON", self.paddle_init_extra_json)
+        form.addRow("Extra PaddleOCR run kwargs JSON", self.paddle_run_extra_json)
+
+        self.tabs.addTab(tab, "PaddleOCR detect")
+
     def build_detect_reference_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
+
+        easy_label = QLabel("EasyOCR / CRAFT detect() options")
+        easy_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(easy_label)
         self.detect_ref_table = self.make_detect_reference_table()
         layout.addWidget(self.detect_ref_table)
+
+        paddle_label = QLabel("PaddleOCR detector options")
+        paddle_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(paddle_label)
+        self.paddle_ref_table = self.make_paddle_detect_reference_table()
+        layout.addWidget(self.paddle_ref_table)
+
         note = QLabel(
-            "The GUI passes these values to easyocr.Reader.detect(). "
-            "Extra JSON is merged into the detect() kwargs."
+            "Only the selected detector is used to find text regions. PARSeq still performs recognition on the detected crops."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -570,11 +1324,14 @@ class MainWindow(QMainWindow):
         form = QFormLayout(tab)
 
         self.parseq_repo = QLineEdit("baudm/parseq")
-        self.parseq_model = QLineEdit("parseq")
+        self.parseq_model = QComboBox()
+        self.parseq_model.addItems(PARSEQ_MODEL_OPTIONS)
+        self.parseq_model.setCurrentText("parseq")
+        self.parseq_model.setEditable(True)
         self.parseq_device = QComboBox()
         self.parseq_device.addItems(["auto", "cpu", "cuda", "mps"])
         self.parseq_source = QComboBox()
-        self.parseq_source.addItems(["EasyOCR detect crop", "Original-image scaled crop"])
+        self.parseq_source.addItems(["Detector crop", "Original-image scaled crop"])
         self.parseq_force_reload = QCheckBox("force_reload")
         self.parseq_trust_repo = QCheckBox("trust_repo")
         self.parseq_trust_repo.setChecked(True)
@@ -591,7 +1348,7 @@ class MainWindow(QMainWindow):
         self.parseq_extra_json.setFixedHeight(90)
 
         form.addRow("torch.hub repo", self.parseq_repo)
-        form.addRow("model name", self.parseq_model)
+        form.addRow("model", self.parseq_model)
         form.addRow("device", self.parseq_device)
         form.addRow("PARSeq crop source", self.parseq_source)
         form.addRow(self.parseq_force_reload)
@@ -615,6 +1372,23 @@ class MainWindow(QMainWindow):
         table.verticalHeader().setVisible(False)
 
         for row, values in enumerate(EASYOCR_DETECT_OPTION_REFERENCE):
+            for col, value in enumerate(values):
+                table.setItem(row, col, QTableWidgetItem(str(value)))
+
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        table.resizeRowsToContents()
+        return table
+
+    def make_paddle_detect_reference_table(self) -> QTableWidget:
+        table = QTableWidget(len(PADDLEOCR_DETECT_OPTION_REFERENCE), 4)
+        table.setHorizontalHeaderLabels(["Option", "Default", "Range/Type", "Description"])
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.verticalHeader().setVisible(False)
+
+        for row, values in enumerate(PADDLEOCR_DETECT_OPTION_REFERENCE):
             for col, value in enumerate(values):
                 table.setItem(row, col, QTableWidgetItem(str(value)))
 
@@ -648,6 +1422,21 @@ class MainWindow(QMainWindow):
             if widget is not None:
                 widget.setToolTip(f"{description}\nDefault: {default}\nRange/Type: {range_type}")
 
+        paddle_widgets = {
+            "lang": self.paddle_lang,
+            "device": self.paddle_device,
+            "use_angle_cls": self.paddle_use_angle_cls,
+            "det_limit_side_len": self.paddle_det_limit_side_len,
+            "det_limit_type": self.paddle_det_limit_type,
+            "det_db_thresh": self.paddle_det_db_thresh,
+            "det_db_box_thresh": self.paddle_det_db_box_thresh,
+            "det_db_unclip_ratio": self.paddle_det_db_unclip_ratio,
+        }
+        for option, default, range_type, description in PADDLEOCR_DETECT_OPTION_REFERENCE:
+            widget = paddle_widgets.get(option)
+            if widget is not None:
+                widget.setToolTip(f"{description}\nDefault: {default}\nRange/Type: {range_type}")
+
     def spin_int(self, lo: int, hi: int, val: int) -> QSpinBox:
         s = QSpinBox()
         s.setRange(lo, hi)
@@ -666,6 +1455,12 @@ class MainWindow(QMainWindow):
         self.option_widgets = {
             "image_path": self.image_path,
             "preprocess": self.preprocess_check,
+            "upsample_enabled": self.upsample_check,
+            "upsample_scale": self.upsample_scale,
+            "horizontalize_enabled": self.horizontalize_check,
+            "horizontalize_auto": self.horizontalize_auto_check,
+            "horizontalize_angle": self.horizontalize_angle,
+            "detector_engine": self.detector_engine,
             "languages": self.langs_edit,
             "easyocr_gpu": self.gpu_check,
             "min_size": self.min_size,
@@ -686,6 +1481,16 @@ class MainWindow(QMainWindow):
             "bbox_min_size": self.bbox_min_size,
             "max_candidates": self.max_candidates,
             "detect_extra_json": self.detect_extra_json,
+            "paddle_lang": self.paddle_lang,
+            "paddle_device": self.paddle_device,
+            "paddle_use_angle_cls": self.paddle_use_angle_cls,
+            "paddle_det_limit_side_len": self.paddle_det_limit_side_len,
+            "paddle_det_limit_type": self.paddle_det_limit_type,
+            "paddle_det_db_thresh": self.paddle_det_db_thresh,
+            "paddle_det_db_box_thresh": self.paddle_det_db_box_thresh,
+            "paddle_det_db_unclip_ratio": self.paddle_det_db_unclip_ratio,
+            "paddle_init_extra_json": self.paddle_init_extra_json,
+            "paddle_run_extra_json": self.paddle_run_extra_json,
             "crop_pad": self.crop_pad,
             "thumb_width": self.thumb_width,
             "thumb_height": self.thumb_height,
@@ -728,6 +1533,8 @@ class MainWindow(QMainWindow):
             idx = widget.findText(str(value))
             if idx >= 0:
                 widget.setCurrentIndex(idx)
+            elif widget.isEditable():
+                widget.setEditText(str(value))
         elif isinstance(widget, QTextEdit):
             widget.setPlainText(str(value))
         elif isinstance(widget, QLineEdit):
@@ -759,10 +1566,43 @@ class MainWindow(QMainWindow):
                 widget.valueChanged.connect(lambda *_: self.snapshot_options(clear_redo=True))
             elif isinstance(widget, QComboBox):
                 widget.currentIndexChanged.connect(lambda *_: self.snapshot_options(clear_redo=True))
+                if widget.isEditable():
+                    widget.currentTextChanged.connect(lambda *_: self.snapshot_options(clear_redo=True))
             elif isinstance(widget, QTextEdit):
                 widget.textChanged.connect(lambda *_: self.snapshot_options(clear_redo=True))
             elif isinstance(widget, QLineEdit):
                 widget.textChanged.connect(lambda *_: self.snapshot_options(clear_redo=True))
+
+    def connect_auto_reload_signals(self):
+        self.detector_engine.currentTextChanged.connect(self.on_detector_engine_changed)
+        self.parseq_model.currentTextChanged.connect(self.on_parseq_model_changed)
+
+    def current_parseq_model_name(self) -> str:
+        if isinstance(self.parseq_model, QComboBox):
+            return self.parseq_model.currentText().strip()
+        return self.parseq_model.text().strip()
+
+    def on_detector_engine_changed(self, engine: str):
+        if self.restoring_options:
+            return
+        self.reader = None
+        self.paddleocr_detector = None
+        self.crops = []
+        self.clear_crops()
+        self.result_table.setRowCount(0)
+        self.log(f"Detector changed to {engine}. Reloading detector...")
+        self.reload_detector()
+
+    def on_parseq_model_changed(self, model_name: str):
+        if self.restoring_options:
+            return
+        self.parseq = None
+        self.result_table.setRowCount(0)
+        model_name = str(model_name or "").strip()
+        if not model_name:
+            return
+        self.log(f"PARSeq model changed to {model_name}. Reloading PARSeq...")
+        self.reload_parseq()
 
     def restore_options(self, snap: dict[str, Any]):
         self.restoring_options = True
@@ -803,7 +1643,7 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Choose image",
-            "",
+            str(THIS_DIR),
             "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp);;All Files (*)",
         )
         if not path:
@@ -811,42 +1651,94 @@ class MainWindow(QMainWindow):
         self.image_path.setText(path)
         self.load_image(path)
 
-    def load_image(self, path: str):
+    def load_image(self, path: str, show_error: bool = True):
         frame = cv2.imread(path)
         if frame is None or frame.size == 0:
-            QMessageBox.critical(self, "Image error", f"Could not read image:\n{path}")
+            if show_error:
+                QMessageBox.critical(self, "Image error", f"Could not read image:\n{path}")
+            else:
+                self.log(f"Startup image not loaded: {path}")
             return
         self.frame = frame
         self.detect_img = None
+        self.frame_to_detect_matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        self.detect_to_frame_matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
         self.crops = []
         self.clear_crops()
         self.result_table.setRowCount(0)
         self.preview_label.setPixmap(cv_to_qpixmap(frame, 920, 260))
         self.log(f"Loaded image: {path} shape={frame.shape}")
 
+    def load_default_image_if_available(self):
+        path = self.image_path.text().strip() or str(DEFAULT_IMAGE_PATH)
+        if Path(path).exists():
+            self.load_image(path, show_error=False)
+        else:
+            self.log(f"Default image path does not exist on this machine: {path}")
+
+    def reload_detector(self):
+        engine = self.detector_engine.currentText()
+        if engine.startswith("EasyOCR"):
+            self.reload_reader()
+        elif engine.startswith("PaddleOCR"):
+            self.reload_paddleocr_detector()
+
     def reload_reader(self):
         langs = [x.strip() for x in self.langs_edit.text().split(",") if x.strip()]
         if not langs:
             QMessageBox.warning(self, "EasyOCR", "Enter at least one language, such as en.")
             return
-        self.log(f"Loading EasyOCR Reader languages={langs} gpu={self.gpu_check.isChecked()}...")
+        self.log(f"Loading EasyOCR/CRAFT detector languages={langs} gpu={self.gpu_check.isChecked()}...")
         t0 = perf_counter()
         try:
             self.reader = easyocr.Reader(langs, gpu=self.gpu_check.isChecked(), detector=True, recognizer=False, verbose=False)
         except Exception as exc:
             self.reader = None
-            QMessageBox.critical(self, "EasyOCR load failed", str(exc))
+            QMessageBox.critical(self, "EasyOCR detector load failed", str(exc))
             return
-        self.log(f"EasyOCR Reader loaded in {perf_counter() - t0:.4f}s")
+        self.log(f"EasyOCR/CRAFT detector loaded in {perf_counter() - t0:.4f}s")
+
+    def paddle_init_kwargs(self) -> dict[str, Any]:
+        kwargs = {
+            "det_limit_side_len": self.paddle_det_limit_side_len.value(),
+            "det_limit_type": self.paddle_det_limit_type.currentText(),
+            "det_db_thresh": self.paddle_det_db_thresh.value(),
+            "det_db_box_thresh": self.paddle_det_db_box_thresh.value(),
+            "det_db_unclip_ratio": self.paddle_det_db_unclip_ratio.value(),
+        }
+        kwargs.update(parse_json_kwargs(self.paddle_init_extra_json.toPlainText()))
+        return kwargs
+
+    def paddle_run_kwargs(self) -> dict[str, Any]:
+        return parse_json_kwargs(self.paddle_run_extra_json.toPlainText())
+
+    def reload_paddleocr_detector(self):
+        self.log("Loading PaddleOCR detector...")
+        t0 = perf_counter()
+        try:
+            self.paddleocr_detector = PaddleOCRDetectorRunner(
+                lang=self.paddle_lang.text().strip(),
+                device_choice=self.paddle_device.currentText(),
+                use_angle_cls=self.paddle_use_angle_cls.isChecked(),
+                init_kwargs=self.paddle_init_kwargs(),
+            )
+        except Exception as exc:
+            self.paddleocr_detector = None
+            QMessageBox.critical(self, "PaddleOCR detector load failed", str(exc))
+            return
+        self.log(
+            f"PaddleOCR detector loaded in {perf_counter() - t0:.4f}s "
+            f"with init kwargs: {self.paddleocr_detector.init_kwargs}"
+        )
 
     def reload_parseq(self):
-        self.log("Loading PARSeq...")
+        self.log(f"Loading PARSeq model={self.current_parseq_model_name()}...")
         t0 = perf_counter()
         try:
             extra = parse_json_kwargs(self.parseq_extra_json.toPlainText())
             self.parseq = PARSeqRunner(
                 repo=self.parseq_repo.text().strip(),
-                model_name=self.parseq_model.text().strip(),
+                model_name=self.current_parseq_model_name(),
                 device_choice=self.parseq_device.currentText(),
                 force_reload=self.parseq_force_reload.isChecked(),
                 trust_repo=self.parseq_trust_repo.isChecked(),
@@ -861,7 +1753,7 @@ class MainWindow(QMainWindow):
             self.parseq = None
             QMessageBox.critical(self, "PARSeq load failed", str(exc))
             return
-        self.log(f"PARSeq loaded in {perf_counter() - t0:.4f}s on device={self.parseq.device}")
+        self.log(f"PARSeq loaded model={self.parseq.model_name} in {perf_counter() - t0:.4f}s on device={self.parseq.device}")
 
     def detect_kwargs(self) -> dict[str, Any]:
         kwargs = {
@@ -896,24 +1788,49 @@ class MainWindow(QMainWindow):
             if self.frame is None:
                 QMessageBox.warning(self, "No image", "Load an image first.")
                 return
+
+        engine = self.detector_engine.currentText()
+        try:
+            upsample_scale = parse_scale_choice(self.upsample_scale.currentText())
+            self.detect_img, self.frame_to_detect_matrix, steps = build_detection_preprocess_image(
+                self.frame,
+                use_ocr_preprocess=self.preprocess_check.isChecked(),
+                upsample_enabled=self.upsample_check.isChecked(),
+                upsample_scale=upsample_scale,
+                horizontalize_enabled=self.horizontalize_check.isChecked(),
+                horizontalize_auto=self.horizontalize_auto_check.isChecked(),
+                manual_angle=self.horizontalize_angle.value(),
+            )
+            self.detect_to_frame_matrix = cv2.invertAffineTransform(self.frame_to_detect_matrix)
+        except Exception as exc:
+            QMessageBox.critical(self, "Preprocessing failed", str(exc))
+            return
+
+        if steps:
+            self.preview_label.setPixmap(cv_to_qpixmap(self.detect_img, 920, 260))
+            self.log(f"Using processed image for {engine}: " + "; ".join(steps))
+            self.log(f"Detection image shape={self.detect_img.shape}; original shape={self.frame.shape}")
+        else:
+            self.preview_label.setPixmap(cv_to_qpixmap(self.frame, 920, 260))
+            self.log(f"Using original image for {engine}.")
+
+        if engine.startswith("EasyOCR"):
+            self.run_easyocr_detect()
+        elif engine.startswith("PaddleOCR"):
+            self.run_paddleocr_detect()
+
+    def run_easyocr_detect(self):
         if self.reader is None:
             self.reload_reader()
             if self.reader is None:
                 return
-
-        if self.preprocess_check.isChecked():
-            self.detect_img = preprocess_for_ocr(self.frame)
-            self.log("Using preprocessed image for EasyOCR detect().")
-        else:
-            self.detect_img = self.frame.copy()
-            self.log("Using original image for EasyOCR detect().")
 
         try:
             kwargs = supported_kwargs(self.reader.detect, self.detect_kwargs())
         except Exception:
             kwargs = self.detect_kwargs()
 
-        self.log(f"Running EasyOCR detect() with kwargs: {kwargs}")
+        self.log(f"Running EasyOCR/CRAFT detect() with kwargs: {kwargs}")
         t0 = perf_counter()
         try:
             raw_out = self.reader.detect(self.detect_img, **kwargs)
@@ -922,9 +1839,50 @@ class MainWindow(QMainWindow):
             return
         dt = perf_counter() - t0
         horizontal, free = normalize_detect_output(raw_out)
-        self.log(f"EasyOCR detect() finished in {dt:.4f}s. horizontal={len(horizontal)} free={len(free)}")
+        self.log(f"EasyOCR/CRAFT detect() finished in {dt:.4f}s. horizontal={len(horizontal)} free={len(free)}")
         self.crops = self.make_crops(horizontal, free)
         self.show_crops()
+
+    def run_paddleocr_detect(self):
+        if self.paddleocr_detector is None:
+            self.reload_paddleocr_detector()
+            if self.paddleocr_detector is None:
+                return
+
+        kwargs = self.paddle_run_kwargs()
+        try:
+            paddle_input = ensure_paddleocr_compatible_image(self.detect_img)
+        except Exception as exc:
+            QMessageBox.critical(self, "PaddleOCR input error", str(exc))
+            return
+
+        if paddle_input.shape[:2] == self.detect_img.shape[:2] and getattr(self.detect_img, "ndim", 0) == 2:
+            self.log("Converted preprocessed grayscale image to 3-channel BGR for PaddleOCR.")
+
+        self.log(f"Running PaddleOCR detection-only mode with run kwargs: {kwargs}")
+        t0 = perf_counter()
+        try:
+            boxes, output_desc = self.paddleocr_detector.detect(paddle_input, kwargs)
+        except Exception as exc:
+            QMessageBox.critical(self, "PaddleOCR detect failed", str(exc))
+            return
+        dt = perf_counter() - t0
+        self.log(f"PaddleOCR detection finished in {dt:.4f}s. boxes={len(boxes)}; {output_desc}")
+        self.crops = self.make_crops_from_points(boxes, kind="paddle")
+        self.show_crops()
+
+    def map_detect_points_to_original(self, pts: Any) -> np.ndarray:
+        try:
+            matrix = getattr(self, "detect_to_frame_matrix", None)
+            if matrix is not None:
+                mapped = transform_points_affine(pts, matrix)
+                if np.isfinite(mapped).all():
+                    return np.asarray(mapped, dtype=np.float32)
+        except Exception:
+            pass
+        assert self.detect_img is not None
+        assert self.frame is not None
+        return scale_box_points(pts, self.detect_img.shape, self.frame.shape)
 
     def make_crops(self, horizontal: list[Any], free: list[Any]) -> list[DetectedCrop]:
         crops: list[DetectedCrop] = []
@@ -937,7 +1895,7 @@ class MainWindow(QMainWindow):
             try:
                 pts = horizontal_box_to_points(box)
                 detect_crop = crop_easyocr_text_region(self.detect_img, pts, pad=pad)
-                original_pts = scale_box_points(pts, self.detect_img.shape, self.frame.shape)
+                original_pts = self.map_detect_points_to_original(pts)
                 original_crop = crop_easyocr_text_region(self.frame, original_pts, pad=pad)
                 crops.append(DetectedCrop(idx, "horizontal", pts, detect_crop, original_crop))
                 idx += 1
@@ -948,12 +1906,32 @@ class MainWindow(QMainWindow):
             try:
                 pts = np.array(box, dtype=np.float32).reshape(4, 2)
                 detect_crop = crop_easyocr_text_region(self.detect_img, pts, pad=pad)
-                original_pts = scale_box_points(pts, self.detect_img.shape, self.frame.shape)
+                original_pts = self.map_detect_points_to_original(pts)
                 original_crop = crop_easyocr_text_region(self.frame, original_pts, pad=pad)
                 crops.append(DetectedCrop(idx, "free", pts, detect_crop, original_crop))
                 idx += 1
             except Exception as exc:
                 self.log(f"Skipped free box due to error: {exc}")
+
+        return crops
+
+    def make_crops_from_points(self, boxes: list[Any], kind: str) -> list[DetectedCrop]:
+        crops: list[DetectedCrop] = []
+        idx = 1
+        pad = self.crop_pad.value()
+        assert self.detect_img is not None
+        assert self.frame is not None
+
+        for box in boxes:
+            try:
+                pts = np.array(box, dtype=np.float32).reshape(4, 2)
+                detect_crop = crop_easyocr_text_region(self.detect_img, pts, pad=pad)
+                original_pts = self.map_detect_points_to_original(pts)
+                original_crop = crop_easyocr_text_region(self.frame, original_pts, pad=pad)
+                crops.append(DetectedCrop(idx, kind, pts, detect_crop, original_crop))
+                idx += 1
+            except Exception as exc:
+                self.log(f"Skipped {kind} box due to error: {exc}")
 
         return crops
 
@@ -979,7 +1957,7 @@ class MainWindow(QMainWindow):
 
     def run_parseq(self):
         if not self.crops:
-            QMessageBox.warning(self, "No crops", "Run EasyOCR detect() first.")
+            QMessageBox.warning(self, "No crops", "Run text detection first.")
             return
         if self.parseq is None:
             self.reload_parseq()
@@ -988,8 +1966,9 @@ class MainWindow(QMainWindow):
 
         self.result_table.setRowCount(0)
         source_name = self.parseq_source.currentText()
+        model_name = getattr(self.parseq, "model_name", self.current_parseq_model_name())
         use_original = source_name == "Original-image scaled crop"
-        self.log(f"Running PARSeq on {len(self.crops)} crop(s), source={source_name}...")
+        self.log(f"Running PARSeq model={model_name} on {len(self.crops)} crop(s), source={source_name}...")
 
         for crop in self.crops:
             img = crop.original_crop if use_original else crop.detect_crop
@@ -1007,7 +1986,7 @@ class MainWindow(QMainWindow):
             row = self.result_table.rowCount()
             self.result_table.insertRow(row)
             self.result_table.setItem(row, 0, QTableWidgetItem(str(crop.index)))
-            self.result_table.setItem(row, 1, QTableWidgetItem(source_name))
+            self.result_table.setItem(row, 1, QTableWidgetItem(f"{source_name} | {model_name}"))
             self.result_table.setItem(row, 2, QTableWidgetItem(text))
             self.result_table.setItem(row, 3, QTableWidgetItem(f"{conf:.4f}"))
             self.result_table.setItem(row, 4, QTableWidgetItem(f"{dt:.4f}s"))
