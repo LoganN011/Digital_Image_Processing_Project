@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-"""
-easyocr_parseq_qt_lab.py
-
-  pip install PyQt6 easyocr torch torchvision pillow opencv-python numpy
-  pip install strhub-sdk
-  pip install paddleocr paddlepaddle    # optional, only needed for PaddleOCR detection
-"""
 
 from __future__ import annotations
 
@@ -71,7 +64,7 @@ try:
 except Exception:
     pass
 
-THIS_DIR = Path(__file__).parent    # Start file browse in the directory of this script
+THIS_DIR = Path(__file__).parent
 DEFAULT_IMAGE_PATH = THIS_DIR / "test_poster.png"
 
 IMAGE_STREAM_HOST = "127.0.0.1"
@@ -287,7 +280,6 @@ def estimate_text_angle_degrees(image: np.ndarray) -> float:
     if angles:
         return float(np.median(np.array(angles, dtype=np.float32)))
 
-    # Fallback: estimate orientation from connected foreground pixels.
     try:
         blur = cv2.GaussianBlur(gray_small, (3, 3), 0)
         _, th = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -387,7 +379,6 @@ def build_detection_preprocess_image(
             steps.append(f"upsample {scale:.2f}x")
 
     if use_ocr_preprocess:
-        # If the user explicitly upsamples, do not undo it with the old 1800-px cap.
         allow_internal_resize = not (upsample_enabled and float(upsample_scale) > 1.0)
         image, pm, pre_steps = preprocess_for_ocr_with_matrix(image, allow_internal_resize=allow_internal_resize)
         matrix = compose_affine(pm, matrix)
@@ -534,7 +525,6 @@ def normalize_paddleocr_detection_output(out: Any) -> list[np.ndarray]:
             return
         visited.add(oid)
 
-        # PaddleOCR 3.x Result object: result.json is usually a dict like {"res": {...}}
         for attr in ("json", "res", "result"):
             if hasattr(obj, attr):
                 try:
@@ -580,7 +570,7 @@ def normalize_paddleocr_detection_output(out: Any) -> list[np.ndarray]:
                     walk(obj[key])
             if found_preferred:
                 return
-            # Many PaddleOCR 3.x results are wrapped as {"res": {...}}.
+
             for value in obj.values():
                 walk(value)
             return
@@ -593,8 +583,6 @@ def normalize_paddleocr_detection_output(out: Any) -> list[np.ndarray]:
                 boxes.append(quad)
                 return
 
-            # PaddleOCR 2.x detection-only result can be [[box1, box2, ...]].
-            # Full OCR result can be [[box, (text, score)], ...]; take the first item.
             if len(obj) == 2:
                 first_quad = as_quad_points(obj[0])
                 if first_quad is not None:
@@ -707,8 +695,6 @@ class PaddleOCRDetectorRunner:
         elif device_choice == "cpu":
             device_value = "cpu"
 
-        # Preferred PaddleOCR 3.x path: the standalone TextDetection module.
-        # This avoids running recognition at all; PARSeq remains the recognizer.
         TextDetection = getattr(paddleocr_pkg, "TextDetection", None)
         if TextDetection is not None:
             td_extra = dict(extra)
@@ -749,8 +735,6 @@ class PaddleOCRDetectorRunner:
         if PaddleOCR is None:
             raise RuntimeError(f"Could not initialize PaddleOCR TextDetection fallback: {last_text_detection_exc}")
 
-        # Fallback: PaddleOCR pipeline API. This is more compatible, but may run extra OCR stages.
-        # Keep it because older PaddleOCR wheels do not expose TextDetection.
         pipeline_extra = dict(extra)
         modern_base: dict[str, Any] = {
             "lang": lang,
@@ -831,9 +815,6 @@ class PaddleOCRDetectorRunner:
             except Exception as exc:
                 errors.append(f"TextDetection.predict() failed: {exc}")
 
-        # PaddleOCR 3.x pipeline path. predict(input=np.ndarray, ...) returns Result objects
-        # containing dt_polys. This avoids the older ocr(..., det=True, rec=False) path that can
-        # throw tuple/list index errors with newer PaddleOCR releases.
         if self.ocr is not None and hasattr(self.ocr, "predict"):
             predict_kwargs = dict(self.default_predict_kwargs)
             predict_kwargs.update(self._to_pipeline_predict_kwargs(clean_kwargs))
@@ -847,7 +828,6 @@ class PaddleOCRDetectorRunner:
             except Exception as exc:
                 errors.append(f"PaddleOCR.predict() failed: {exc}")
 
-        # Fallback for PaddleOCR 2.x.
         if self.ocr is not None and hasattr(self.ocr, "ocr"):
             old_kwargs = {
                 k: v for k, v in clean_kwargs.items()
@@ -865,7 +845,6 @@ class PaddleOCRDetectorRunner:
             except Exception as exc:
                 errors.append(f"ocr(det=True, rec=False) failed: {exc}")
 
-            # Some old builds prefer image paths rather than ndarray input. Use a temporary PNG.
             try:
                 import tempfile
                 tmp_path = None
@@ -888,7 +867,6 @@ class PaddleOCRDetectorRunner:
 
     def _clean_run_kwargs(self, run_kwargs: dict[str, Any]) -> dict[str, Any]:
         clean = dict(run_kwargs or {})
-        # Recognition is intentionally not run here; PARSeq handles recognition.
         for key in ("det", "rec", "cls"):
             clean.pop(key, None)
         return clean
