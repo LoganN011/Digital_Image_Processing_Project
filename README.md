@@ -37,7 +37,7 @@ pip install git+https://github.com/IDEA-Research/GroundingDINO.git
 The `Debugging_GUI` uses YOLO for rapid video processing instead of SAM3 or Grounding DINO.
 
 ```bash
-pip install PyQt6 opencv-python Pillow pyttsx3 transformers torch torchvision easyocr numpy timm einops ftfy pywin32 wordninja nltk pytorch-lightning ultralytics
+pip install PyQt6 opencv-python Pillow pyttsx3 transformers torch torchvision easyocr numpy timm einops ftfy pywin32 wordninja nltk pytorch-lightning ultralytics lapx
 ```
 
 # Computer Vision Engines
