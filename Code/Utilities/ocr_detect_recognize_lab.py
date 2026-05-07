@@ -13,7 +13,9 @@ import inspect
 import json
 import math
 import re
+import socket
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -25,7 +27,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtGui import QImage, QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
@@ -70,7 +72,10 @@ except Exception:
     pass
 
 THIS_DIR = Path(__file__).parent    # Start file browse in the directory of this script
-DEFAULT_IMAGE_PATH = Path("/Users/macintosh/UNM/CS591 Digital Image Processing/Final_Project/Code/Utilities/a_poster_sent_to_ocr.png")
+DEFAULT_IMAGE_PATH = THIS_DIR / "test_poster.png"
+
+IMAGE_STREAM_HOST = "127.0.0.1"
+DEFAULT_IMAGE_STREAM_PORT = 49327
 
 PARSEQ_MODEL_OPTIONS = [
     "parseq",
@@ -1038,11 +1043,96 @@ class PARSeqRunner:
             return 0.0
 
 
-class MainWindow(QMainWindow):
-    def __init__(self):
+class ImagePathStreamReceiver(QObject):
+    image_path_received = pyqtSignal(str)
+    status_message = pyqtSignal(str)
+
+    def __init__(self, host: str, port: int):
         super().__init__()
-        self.setWindowTitle("Text Detection + PARSeq Lab")
+        self.host = str(host)
+        self.port = int(port)
+        self._stop_event = threading.Event()
+        self._server_socket: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name="ocr-image-stream-receiver", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        sock = self._server_socket
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _run(self) -> None:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+                self._server_socket = server
+                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                server.bind((self.host, self.port))
+                server.listen(8)
+                server.settimeout(0.5)
+                self.status_message.emit(f"Image stream receiver listening on {self.host}:{self.port}")
+
+                while not self._stop_event.is_set():
+                    try:
+                        conn, _addr = server.accept()
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    with conn:
+                        data = bytearray()
+                        conn.settimeout(1.0)
+                        while True:
+                            try:
+                                chunk = conn.recv(65536)
+                            except socket.timeout:
+                                break
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                            if b"\n" in chunk:
+                                break
+                        self._handle_payload(bytes(data))
+        except OSError as exc:
+            self.status_message.emit(
+                f"Image stream receiver could not bind to {self.host}:{self.port}: {exc}. "
+                "If another OCR lab window is already open, the crop lab will stream to that window."
+            )
+        finally:
+            self._server_socket = None
+
+    def _handle_payload(self, payload: bytes) -> None:
+        for raw_line in payload.splitlines():
+            if not raw_line.strip():
+                continue
+            try:
+                message = json.loads(raw_line.decode("utf-8"))
+            except Exception as exc:
+                self.status_message.emit(f"Ignored malformed image-stream message: {exc}")
+                continue
+            image_path = message.get("image_path") or message.get("path")
+            if image_path:
+                self.image_path_received.emit(str(image_path))
+            else:
+                self.status_message.emit("Ignored image-stream message without an image_path field.")
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, initial_image_path: str | Path | None = None, stream_port: int | None = DEFAULT_IMAGE_STREAM_PORT):
+        super().__init__()
+        self.setWindowTitle("")
         self.resize(1500, 920)
+        self.initial_image_path = str(Path(initial_image_path).expanduser()) if initial_image_path else str(DEFAULT_IMAGE_PATH)
+        self.stream_port = stream_port
+        self.image_stream_receiver: ImagePathStreamReceiver | None = None
         self.frame: np.ndarray | None = None
         self.detect_img: np.ndarray | None = None
         self.frame_to_detect_matrix = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
@@ -1064,6 +1154,7 @@ class MainWindow(QMainWindow):
         QShortcut(QKeySequence.StandardKey.Undo, self, activated=self.undo_options)
         QShortcut(QKeySequence.StandardKey.Redo, self, activated=self.redo_options)
         self.load_default_image_if_available()
+        self.start_image_stream_receiver()
 
     def build_ui(self):
         root = QWidget()
@@ -1154,7 +1245,7 @@ class MainWindow(QMainWindow):
 
         image_group = QGroupBox("Image")
         image_form = QFormLayout(image_group)
-        self.image_path = QLineEdit(str(DEFAULT_IMAGE_PATH))
+        self.image_path = QLineEdit(self.initial_image_path)
         image_form.addRow("Image path", self.image_path)
         self.preprocess_check = QCheckBox("Use standalone preprocessing before text detection")
         self.preprocess_check.setChecked(True)
@@ -1186,7 +1277,7 @@ class MainWindow(QMainWindow):
         detector_form = QFormLayout(detector_group)
         self.detector_engine = QComboBox()
         self.detector_engine.addItems(["EasyOCR / CRAFT", "PaddleOCR detector"])
-        self.detector_engine.setCurrentText("PaddleOCR detector")
+        self.detector_engine.setCurrentText("EasyOCR / CRAFT")
         detector_form.addRow("Detector", self.detector_engine)
         layout.addWidget(detector_group)
 
@@ -1676,6 +1767,27 @@ class MainWindow(QMainWindow):
         else:
             self.log(f"Default image path does not exist on this machine: {path}")
 
+    def start_image_stream_receiver(self) -> None:
+        if self.stream_port is None:
+            return
+        self.image_stream_receiver = ImagePathStreamReceiver(IMAGE_STREAM_HOST, int(self.stream_port))
+        self.image_stream_receiver.image_path_received.connect(self.receive_streamed_image_path)
+        self.image_stream_receiver.status_message.connect(self.log)
+        self.image_stream_receiver.start()
+
+    def receive_streamed_image_path(self, path: str) -> None:
+        path = str(Path(path).expanduser())
+        self.image_path.setText(path)
+        self.load_image(path, show_error=True)
+        self.log(f"Received streamed crop image: {path}")
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event) -> None:
+        if self.image_stream_receiver is not None:
+            self.image_stream_receiver.stop()
+        event.accept()
+
     def reload_detector(self):
         engine = self.detector_engine.currentText()
         if engine.startswith("EasyOCR"):
@@ -1997,9 +2109,56 @@ class MainWindow(QMainWindow):
         self.log("PARSeq finished.")
 
 
+def parse_startup_args(args: list[str]) -> tuple[str | None, int | None]:
+    image_path: str | None = None
+    stream_port: int | None = DEFAULT_IMAGE_STREAM_PORT
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in {"--image", "--image-path"} and i + 1 < len(args):
+            image_path = args[i + 1]
+            i += 2
+            continue
+        if arg.startswith("--image="):
+            image_path = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg.startswith("--image-path="):
+            image_path = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg in {"--ipc-port", "--stream-port"} and i + 1 < len(args):
+            try:
+                stream_port = int(args[i + 1])
+            except ValueError:
+                stream_port = DEFAULT_IMAGE_STREAM_PORT
+            i += 2
+            continue
+        if arg.startswith("--ipc-port=") or arg.startswith("--stream-port="):
+            try:
+                stream_port = int(arg.split("=", 1)[1])
+            except ValueError:
+                stream_port = DEFAULT_IMAGE_STREAM_PORT
+            i += 1
+            continue
+        if arg == "--no-image-stream":
+            stream_port = None
+            i += 1
+            continue
+        if not arg.startswith("-") and image_path is None:
+            image_path = arg
+        i += 1
+    return image_path, stream_port
+
+
+def startup_image_path_from_args(args: list[str]) -> str | None:
+    return parse_startup_args(args)[0]
+
+
 def main():
-    app = QApplication(sys.argv)
-    win = MainWindow()
+    image_path, stream_port = parse_startup_args(sys.argv[1:])
+    app = QApplication(sys.argv[:1])
+    win = MainWindow(image_path, stream_port=stream_port)
     win.show()
     sys.exit(app.exec())
 
