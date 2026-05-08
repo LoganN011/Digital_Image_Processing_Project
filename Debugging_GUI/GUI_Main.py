@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import csv
+import json
 import queue
 import sys
 import threading
 import warnings
+from datetime import datetime
 from pathlib import Path
 
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -131,14 +134,99 @@ class VideoSourceManager:
         return self.cap
 
 
+class OCRWarmupWorker(QThread):
+    """Load the heavy PARSeq recognizer in the background at app startup.
+
+    The worker intentionally loads only PARSeq. EasyOCR/CRAFT detection stays
+    lazy because it is needed only when real OCR jobs are queued. The loaded
+    OCREngine instance is later handed to OCRWorkerPool so the first OCR crop
+    does not pay the full PARSeq startup cost.
+    """
+
+    status_changed = pyqtSignal(str)
+    finished_loading = pyqtSignal(bool, str)
+
+    def __init__(self, engine_factory=OCREngine):
+        super().__init__()
+        self.engine_factory = engine_factory
+        self.ready_event = threading.Event()
+        self.engine = None
+        self.error = None
+
+    def run(self):
+        try:
+            self.status_changed.emit("OCR/PARSeq: loading in background...")
+            engine = self.engine_factory(lazy_load=True)
+            ok = bool(engine.load_parseq_if_needed())
+            if ok:
+                self.engine = engine
+                self.error = None
+                self.status_changed.emit("OCR/PARSeq: ready")
+                self.finished_loading.emit(True, "OCR/PARSeq: ready")
+            else:
+                self.engine = None
+                self.error = engine.parseq_error or "PARSeq failed to load"
+                message = f"OCR/PARSeq: failed to load ({self.error})"
+                self.status_changed.emit(message)
+                self.finished_loading.emit(False, message)
+        except Exception as exc:
+            self.engine = None
+            self.error = str(exc)
+            message = f"OCR/PARSeq: failed to load ({exc})"
+            self.status_changed.emit(message)
+            self.finished_loading.emit(False, message)
+        finally:
+            self.ready_event.set()
+
+
+
+
+class CaptionWarmupWorker(QThread):
+    """Load the BLIP caption model in the background at app startup.
+
+    This only constructs ImageCaptioner early; it does not generate captions
+    until final best crops are queued later. The loaded captioner is handed to
+    CaptionWorker so the first caption job does not pay the full BLIP startup
+    cost.
+    """
+
+    status_changed = pyqtSignal(str)
+    finished_loading = pyqtSignal(bool, str)
+
+    def __init__(self, captioner_factory=ImageCaptioner):
+        super().__init__()
+        self.captioner_factory = captioner_factory
+        self.ready_event = threading.Event()
+        self.captioner = None
+        self.error = None
+
+    def run(self):
+        try:
+            self.status_changed.emit("Caption/BLIP: loading in background...")
+            captioner = self.captioner_factory()
+            self.captioner = captioner
+            self.error = None
+            self.status_changed.emit("Caption/BLIP: ready")
+            self.finished_loading.emit(True, "Caption/BLIP: ready")
+        except Exception as exc:
+            self.captioner = None
+            self.error = str(exc)
+            message = f"Caption/BLIP: failed to load ({exc})"
+            self.status_changed.emit(message)
+            self.finished_loading.emit(False, message)
+        finally:
+            self.ready_event.set()
+
+
 class OCRWorkerPool(QThread):
     ocr_ready = pyqtSignal(object, str, object)
     ocr_progress = pyqtSignal(object, object)
 
-    def __init__(self, worker_count=2, engine_factory=OCREngine):
+    def __init__(self, worker_count=2, engine_factory=OCREngine, engine_provider=None):
         super().__init__()
         self.worker_count = max(1, int(worker_count))
         self.engine_factory = engine_factory
+        self.engine_provider = engine_provider
         self.queue = queue.Queue()
         self.lock = threading.Lock()
         self.pending_jobs = {}
@@ -187,13 +275,14 @@ class OCRWorkerPool(QThread):
         for thread in self.worker_threads:
             thread.join()
 
+    def _load_engine_for_worker(self):
+        if self.engine_provider is not None:
+            return self.engine_provider()
+        return self.engine_factory()
+
     def _worker_loop(self, worker_number):
-        try:
-            engine = self.engine_factory()
-            engine_error = None
-        except Exception as exc:
-            engine = None
-            engine_error = str(exc)
+        engine = None
+        engine_error = None
         while True:
             poster_key = self.queue.get()
             if poster_key is None:
@@ -206,6 +295,21 @@ class OCRWorkerPool(QThread):
                 continue
             poster_key, image_input, options, generation = job
             try:
+                if engine is None and engine_error is None:
+                    self.ocr_progress.emit(
+                        poster_key,
+                        {
+                            "message": f"W{worker_number}: OCR engine loading / waiting for PARSeq",
+                            "percent": 1,
+                            "stage": "loading_models",
+                            "generation": generation,
+                        },
+                    )
+                    try:
+                        engine = self._load_engine_for_worker()
+                    except Exception as exc:
+                        engine = None
+                        engine_error = str(exc)
                 if engine is None:
                     raise RuntimeError(engine_error or "OCR engine failed to initialize")
                 options["progress_callback"] = self._make_progress_callback(poster_key, generation, worker_number)
@@ -260,6 +364,9 @@ class OCRWorkerPool(QThread):
                 "parseq_conf": safe_float(getattr(line, "parseq_conf", 0.0)),
                 "easyocr_text": str(getattr(line, "easyocr_text", "") or ""),
                 "easyocr_conf": safe_float(getattr(line, "easyocr_conf", 0.0)),
+                "row_index": int(getattr(line, "row_index", idx)),
+                "word_index": int(getattr(line, "word_index", 0)),
+                "line_break_after": bool(getattr(line, "line_break_after", False)),
                 "words": [{"text": word, "conf": line_conf} for word in words],
             })
         return {
@@ -285,13 +392,26 @@ class CaptionWorker(QThread):
     caption_ready = pyqtSignal(object, str)
     caption_progress = pyqtSignal(object, object)
 
-    def __init__(self, captioner):
+    def __init__(self, captioner_factory=ImageCaptioner, captioner_provider=None):
         super().__init__()
-        self.captioner = captioner
+        # BLIP is warmed at app startup when possible. Caption generation still
+        # waits until final crops are queued; this worker simply reuses the
+        # background-loaded captioner instead of constructing a cold one.
+        self.captioner_factory = captioner_factory
+        self.captioner_provider = captioner_provider
+        self.captioner = None
         self.queue = queue.Queue()
         self.lock = threading.Lock()
         self.pending_jobs = {}
         self.stopping = False
+
+    def _ensure_captioner(self):
+        if self.captioner is None:
+            if self.captioner_provider is not None:
+                self.captioner = self.captioner_provider()
+            else:
+                self.captioner = self.captioner_factory()
+        return self.captioner
 
     def add_task(self, poster_key, pil_image):
         if self.stopping:
@@ -343,8 +463,10 @@ class CaptionWorker(QThread):
                 continue
             poster_key, pil_image = job
             try:
+                self.caption_progress.emit(poster_key, {"message": "Caption engine loading / waiting for BLIP", "percent": 10, "stage": "loading"})
+                captioner = self._ensure_captioner()
                 self.caption_progress.emit(poster_key, {"message": "Captioning image", "percent": 35, "stage": "captioning"})
-                caption = "Description unavailable." if pil_image is None else str(self.captioner.generate_caption(pil_image) or "").strip() or "(no description)"
+                caption = "Description unavailable." if pil_image is None else str(captioner.generate_caption(pil_image) or "").strip() or "(no description)"
                 self.caption_progress.emit(poster_key, {"message": "Caption done", "percent": 100, "stage": "done"})
                 self.caption_ready.emit(poster_key, caption)
             except Exception as exc:
@@ -386,19 +508,193 @@ class PosterReaderApp(QWidget):
         self.timer = QTimer()
         self.timer.timeout.connect(self.process_frame)
         self.speaker = AudioEngine()
-        self.captioner = ImageCaptioner()
+        # PARSeq and BLIP start warming in the background immediately. OCR and
+        # caption jobs are still delayed until final best crops are ready.
         self.ocr_worker = None
         self.caption_worker = None
         self.retired_threads = []
-        self.start_post_processing_workers()
+        self.ocr_warmup_worker = None
+        self.caption_warmup_worker = None
+        self.preloaded_ocr_engine = None
+        self.preloaded_ocr_engine_claimed = False
+        self.preloaded_captioner = None
+        self.preloaded_captioner_claimed = False
+        self.ocr_warmup_error = None
+        self.caption_warmup_error = None
+        self.ocr_warmup_status_message = "OCR/PARSeq: preparing background load..."
+        self.caption_warmup_status_message = "Caption/BLIP: preparing background load..."
+        self.ocr_warmup_lock = threading.Lock()
+        self.caption_warmup_lock = threading.Lock()
+        self.start_ocr_background_warmup()
+        self.start_caption_background_warmup()
+
+    def start_ocr_background_warmup(self):
+        """Start loading PARSeq as soon as the app opens, without blocking the UI."""
+        if self.ocr_warmup_worker is not None:
+            try:
+                if self.ocr_warmup_worker.isRunning():
+                    return
+            except Exception:
+                pass
+        self.ocr_warmup_error = None
+        self.ocr_warmup_worker = OCRWarmupWorker()
+        self.ocr_warmup_worker.status_changed.connect(self.on_ocr_warmup_status)
+        self.ocr_warmup_worker.finished_loading.connect(self.on_ocr_warmup_finished)
+        self.ocr_warmup_worker.start()
+
+    def on_ocr_warmup_status(self, message):
+        self.ocr_warmup_status_message = str(message or "")
+        self.update_background_model_status_labels()
+
+    def on_ocr_warmup_finished(self, ok, message):
+        worker = self.ocr_warmup_worker
+        with self.ocr_warmup_lock:
+            if bool(ok) and worker is not None and getattr(worker, "engine", None) is not None:
+                # If the OCR worker thread already claimed the engine while the
+                # queued Qt signal was waiting to run, do not mark it unclaimed.
+                if not self.preloaded_ocr_engine_claimed:
+                    self.preloaded_ocr_engine = worker.engine
+                self.ocr_warmup_error = None
+            else:
+                self.preloaded_ocr_engine = None
+                self.preloaded_ocr_engine_claimed = False
+                self.ocr_warmup_error = str(message or "PARSeq failed to load")
+        self.on_ocr_warmup_status(message)
+
+
+    def start_caption_background_warmup(self):
+        """Start loading BLIP as soon as the app opens, without blocking the UI."""
+        if self.caption_warmup_worker is not None:
+            try:
+                if self.caption_warmup_worker.isRunning():
+                    return
+            except Exception:
+                pass
+        self.caption_warmup_error = None
+        self.caption_warmup_worker = CaptionWarmupWorker()
+        self.caption_warmup_worker.status_changed.connect(self.on_caption_warmup_status)
+        self.caption_warmup_worker.finished_loading.connect(self.on_caption_warmup_finished)
+        self.caption_warmup_worker.start()
+
+    def on_caption_warmup_status(self, message):
+        self.caption_warmup_status_message = str(message or "")
+        self.update_background_model_status_labels()
+
+    def on_caption_warmup_finished(self, ok, message):
+        worker = self.caption_warmup_worker
+        with self.caption_warmup_lock:
+            if bool(ok) and worker is not None and getattr(worker, "captioner", None) is not None:
+                # If the caption worker thread already claimed the captioner
+                # while this queued Qt signal was waiting to run, do not mark
+                # it unclaimed again.
+                if not self.preloaded_captioner_claimed:
+                    self.preloaded_captioner = worker.captioner
+                self.caption_warmup_error = None
+            else:
+                self.preloaded_captioner = None
+                self.preloaded_captioner_claimed = False
+                self.caption_warmup_error = str(message or "Caption model failed to load")
+        self.on_caption_warmup_status(message)
+
+    def update_background_model_status_labels(self):
+        ocr_msg = str(getattr(self, "ocr_warmup_status_message", "OCR/PARSeq: preparing background load...") or "")
+        caption_msg = str(getattr(self, "caption_warmup_status_message", "Caption/BLIP: preparing background load...") or "")
+        combined = f"{ocr_msg}\n{caption_msg}"
+        if hasattr(self, "ocr_startup_status_label"):
+            self.ocr_startup_status_label.setText(ocr_msg)
+        if hasattr(self, "caption_startup_status_label"):
+            self.caption_startup_status_label.setText(caption_msg)
+        if hasattr(self, "ocr_global_status_label") and len(getattr(self, "poster_data", [])) == 0:
+            self.ocr_global_status_label.setText(combined)
+
+    def is_ocr_warmup_ready(self):
+        with self.ocr_warmup_lock:
+            return self.preloaded_ocr_engine is not None and not self.preloaded_ocr_engine_claimed
+
+    def is_caption_warmup_ready(self):
+        with self.caption_warmup_lock:
+            return self.preloaded_captioner is not None and not self.preloaded_captioner_claimed
+
+    def claim_background_warmed_ocr_engine(self):
+        """Return the warmed OCR engine, waiting in the OCR thread if needed.
+
+        This method is called from OCRWorkerPool's worker thread, not the UI
+        thread, so waiting here does not block video browsing or playback.
+        """
+        worker = self.ocr_warmup_worker
+        with self.ocr_warmup_lock:
+            if self.preloaded_ocr_engine is not None and not self.preloaded_ocr_engine_claimed:
+                self.preloaded_ocr_engine_claimed = True
+                return self.preloaded_ocr_engine
+            warmup_error = self.ocr_warmup_error
+
+        if worker is not None:
+            try:
+                worker.ready_event.wait()
+            except Exception:
+                pass
+            with self.ocr_warmup_lock:
+                if self.preloaded_ocr_engine is not None and not self.preloaded_ocr_engine_claimed:
+                    self.preloaded_ocr_engine_claimed = True
+                    return self.preloaded_ocr_engine
+                if getattr(worker, "engine", None) is not None and not self.preloaded_ocr_engine_claimed:
+                    self.preloaded_ocr_engine = worker.engine
+                    self.preloaded_ocr_engine_claimed = True
+                    return self.preloaded_ocr_engine
+                warmup_error = self.ocr_warmup_error or getattr(worker, "error", None)
+
+        if warmup_error:
+            raise RuntimeError(warmup_error)
+        return OCREngine()
+
+
+    def claim_background_warmed_captioner(self):
+        """Return the warmed BLIP captioner, waiting in the caption thread if needed.
+
+        This method is called from CaptionWorker's worker thread, not the UI
+        thread, so waiting here does not block video browsing or playback.
+        """
+        worker = self.caption_warmup_worker
+        with self.caption_warmup_lock:
+            if self.preloaded_captioner is not None and not self.preloaded_captioner_claimed:
+                self.preloaded_captioner_claimed = True
+                return self.preloaded_captioner
+            warmup_error = self.caption_warmup_error
+
+        if worker is not None:
+            try:
+                worker.ready_event.wait()
+            except Exception:
+                pass
+            with self.caption_warmup_lock:
+                if self.preloaded_captioner is not None and not self.preloaded_captioner_claimed:
+                    self.preloaded_captioner_claimed = True
+                    return self.preloaded_captioner
+                if getattr(worker, "captioner", None) is not None and not self.preloaded_captioner_claimed:
+                    self.preloaded_captioner = worker.captioner
+                    self.preloaded_captioner_claimed = True
+                    return self.preloaded_captioner
+                warmup_error = self.caption_warmup_error or getattr(worker, "error", None)
+
+        if warmup_error:
+            raise RuntimeError(warmup_error)
+        return ImageCaptioner()
 
     def start_post_processing_workers(self):
-        self.ocr_worker = OCRWorkerPool(worker_count=OCR_WORKER_COUNT)
+        # Called only when post-processing is actually needed. OCRWorkerPool
+        # receives the background-warmed PARSeq engine when available, and
+        # CaptionWorker receives the background-warmed BLIP captioner when available.
+        self.ocr_worker = OCRWorkerPool(
+            worker_count=OCR_WORKER_COUNT,
+            engine_provider=self.claim_background_warmed_ocr_engine,
+        )
         self.ocr_worker.ocr_ready.connect(self.on_ocr_ready)
         self.ocr_worker.ocr_progress.connect(self.on_ocr_progress)
         self.ocr_worker.start()
 
-        self.caption_worker = CaptionWorker(self.captioner)
+        self.caption_worker = CaptionWorker(
+            captioner_provider=self.claim_background_warmed_captioner,
+        )
         self.caption_worker.caption_ready.connect(self.on_caption_ready)
         self.caption_worker.caption_progress.connect(self.on_caption_progress)
         self.caption_worker.start()
@@ -495,8 +791,18 @@ class PosterReaderApp(QWidget):
         btn_file.clicked.connect(self.run_file_input)
         btn_cam = QPushButton("Start Live Record  [2]")
         btn_cam.clicked.connect(self.run_camera_input)
+        self.ocr_startup_status_label = QLabel("OCR/PARSeq: preparing background load...")
+        self.ocr_startup_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.ocr_startup_status_label.setWordWrap(True)
+        self.ocr_startup_status_label.setStyleSheet("color: #555; padding-top: 8px;")
+        self.caption_startup_status_label = QLabel("Caption/BLIP: preparing background load...")
+        self.caption_startup_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.caption_startup_status_label.setWordWrap(True)
+        self.caption_startup_status_label.setStyleSheet("color: #555; padding-top: 2px;")
         layout.addWidget(btn_file)
         layout.addWidget(btn_cam)
+        layout.addWidget(self.ocr_startup_status_label)
+        layout.addWidget(self.caption_startup_status_label)
         self.stack.addWidget(page)
         QShortcut(QKeySequence("1"), self).activated.connect(self.run_file_input)
         QShortcut(QKeySequence("2"), self).activated.connect(self.run_camera_input)
@@ -575,6 +881,11 @@ class PosterReaderApp(QWidget):
         self.btn_stop_proc.setVisible(False)
         self.btn_stop_proc.clicked.connect(self.stop_model_processing)
 
+        self.btn_export_ocr = QPushButton("Export OCR Data  [E]")
+        self.btn_export_ocr.setToolTip("Export poster-level and line-level OCR fields for ground-truth comparison")
+        self.btn_export_ocr.setEnabled(False)
+        self.btn_export_ocr.clicked.connect(self.export_ocr_comparison_data)
+
         button_row = QWidget()
         button_layout = QHBoxLayout(button_row)
         button_layout.setContentsMargins(0, 0, 0, 0)
@@ -582,6 +893,7 @@ class PosterReaderApp(QWidget):
         button_layout.addWidget(btn_test)
         button_layout.addWidget(self.btn_restart)
         button_layout.addWidget(self.btn_stop_proc)
+        button_layout.addWidget(self.btn_export_ocr)
 
         layout.addWidget(button_row)
         layout.addWidget(self.results_status_label)
@@ -602,6 +914,7 @@ class PosterReaderApp(QWidget):
             ("T", self.load_test_posters),
             ("R", self.restart_video_from_beginning),
             ("X", self.stop_model_processing),
+            ("E", self.export_ocr_comparison_data),
             (Qt.Key.Key_Right, lambda: self.move_poster_focus(1)),
             (Qt.Key.Key_Left, lambda: self.move_poster_focus(-1)),
             (Qt.Key.Key_Down, lambda: self.move_poster_focus(GALLERY_COLS)),
@@ -883,11 +1196,26 @@ class PosterReaderApp(QWidget):
     def queue_post_processing_for_all(self):
         if self.post_processing_started:
             return
-        self.ensure_post_processing_workers()
         self.post_processing_started = True
         if not self.poster_data:
             self.update_global_processing_status()
             return
+        if self.is_ocr_warmup_ready() and self.is_caption_warmup_ready():
+            self.results_status_label.setText(
+                f"Detector finished. Starting OCR/captions for {len(self.poster_data)} final best crop(s)..."
+            )
+        else:
+            waiting_for = []
+            if not self.is_ocr_warmup_ready():
+                waiting_for.append("PARSeq")
+            if not self.is_caption_warmup_ready():
+                waiting_for.append("BLIP caption model")
+            wait_text = " and ".join(waiting_for) if waiting_for else "background models"
+            self.results_status_label.setText(
+                f"Detector finished. Waiting for {wait_text}, then OCR/captions for {len(self.poster_data)} final best crop(s)..."
+            )
+        QApplication.processEvents()
+        self.ensure_post_processing_workers()
         for idx, poster in enumerate(self.poster_data):
             image_input = poster.get("image_input")
             if image_input is None:
@@ -989,7 +1317,19 @@ class PosterReaderApp(QWidget):
             return
 
         self.results_status_label.setVisible(True)
-        self.results_status_label.setText(f"Queued {len(files)} local image(s) for OCR testing.")
+        if self.is_ocr_warmup_ready() and self.is_caption_warmup_ready():
+            self.results_status_label.setText(f"Queued {len(files)} local image(s) for OCR/caption testing.")
+        else:
+            waiting_for = []
+            if not self.is_ocr_warmup_ready():
+                waiting_for.append("PARSeq")
+            if not self.is_caption_warmup_ready():
+                waiting_for.append("BLIP caption model")
+            wait_text = " and ".join(waiting_for) if waiting_for else "background models"
+            self.results_status_label.setText(
+                f"Queued {len(files)} local image(s). Waiting for {wait_text} if still loading."
+            )
+        self.ensure_post_processing_workers()
 
         for file_path in files:
             self.add_poster_to_gallery(file_path, "OCR pending...", None)
@@ -1068,6 +1408,7 @@ class PosterReaderApp(QWidget):
         if self.focused_poster_index == -1:
             self.select_poster_index(0, scroll=False, focus=True)
         if run_caption_async and not defer_post_processing:
+            self.ensure_post_processing_workers()
             self.caption_worker.add_task(poster_key, pil_image)
 
     def update_poster_in_gallery(self, poster_id, image_input, detected_text, avg_conf=None, run_caption_async=True, defer_post_processing=False):
@@ -1115,6 +1456,7 @@ class PosterReaderApp(QWidget):
         self.set_button_preview(btn, image_input)
         btn.setToolTip(f"Description: {poster.get('description', '')}")
         if run_caption_async and not defer_post_processing:
+            self.ensure_post_processing_workers()
             self.caption_worker.add_task(poster["poster_key"], pil_image)
         self.update_poster_ready_state(idx)
         if self.focused_poster_index == idx:
@@ -1309,6 +1651,8 @@ class PosterReaderApp(QWidget):
 
     def update_global_processing_status(self):
         total = len(self.poster_data)
+        if hasattr(self, "btn_export_ocr"):
+            self.btn_export_ocr.setEnabled(total > 0)
         if total == 0:
             self.ocr_global_status_label.setText(f"OCR/caption status: 0/0 ready")
             return
@@ -1359,6 +1703,274 @@ class PosterReaderApp(QWidget):
             self.focused_poster_index = self.find_poster_index_by_key(focused_key) or 0
         elif self.poster_data:
             self.focused_poster_index = 0
+
+
+    def export_ocr_comparison_data(self):
+        """Export only the OCR fields needed for comparison against manual readings.
+
+        The export intentionally omits captions, thumbnails, crop image arrays,
+        full crop histories, and other UI/debug fields. It writes:
+          - poster_summary.csv: one row per detected poster/crop,
+          - ocr_lines.csv: one row per accepted OCR line/region,
+          - ocr_export.json: the same comparison data in a structured form.
+        """
+        if self.stack.currentIndex() != 2 or not self.poster_data:
+            QMessageBox.information(self, "Export OCR Data", "No OCR results are available to export yet.")
+            return
+
+        total = len(self.poster_data)
+        ocr_done = sum(1 for poster in self.poster_data if poster.get("ocr_done"))
+        if ocr_done < total:
+            reply = QMessageBox.question(
+                self,
+                "Export OCR Data",
+                f"OCR is still pending for {total - ocr_done} of {total} poster(s). Export the partial data anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        export_root = SCRIPT_DIR / "ocr_exports"
+        export_root.mkdir(parents=True, exist_ok=True)
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "Choose folder for OCR comparison export",
+            str(export_root),
+        )
+        if not selected_dir:
+            return
+
+        video_stem = self._safe_filename(Path(self.video_path).stem if self.video_path else "manual_images")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_dir = Path(selected_dir) / f"ocr_export_{video_stem}_{timestamp}"
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            poster_rows, line_rows, payload = self.build_ocr_comparison_export()
+            self.write_csv(export_dir / "poster_summary.csv", poster_rows, self.poster_summary_export_fields())
+            self.write_csv(export_dir / "ocr_lines.csv", line_rows, self.ocr_line_export_fields())
+            with open(export_dir / "ocr_export.json", "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            QMessageBox.critical(self, "Export OCR Data", f"Failed to export OCR data:\n{exc}")
+            return
+
+        QMessageBox.information(
+            self,
+            "Export OCR Data",
+            "OCR comparison export complete.\n\n"
+            f"Folder:\n{export_dir}\n\n"
+            "Files:\nposter_summary.csv\nocr_lines.csv\nocr_export.json",
+        )
+
+    def build_ocr_comparison_export(self):
+        exported_at = datetime.now().isoformat(timespec="seconds")
+        source_path = str(self.video_path or "")
+        source_video = Path(source_path).name if source_path else ""
+        poster_rows = []
+        line_rows = []
+        json_posters = []
+
+        for rank, poster in enumerate(self.poster_data, 1):
+            details = poster.get("ocr_details") or {}
+            if not isinstance(details, dict):
+                details = {}
+            meta = poster.get("track_meta") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+
+            lines = details.get("lines") or []
+            if not isinstance(lines, list):
+                lines = []
+
+            poster_key = poster.get("poster_key", "")
+            track_id = meta.get("track_id", meta.get("id", poster.get("poster_id", poster_key)))
+            crop_w, crop_h = self.image_input_size(poster.get("image_input"))
+            bbox_value = meta.get("bbox", meta.get("box", meta.get("xyxy")))
+            safe_meta = self.filtered_track_meta_for_export(meta)
+
+            summary_row = {
+                "exported_at": exported_at,
+                "source_video": source_video,
+                "source_path": source_path,
+                "gallery_rank": rank,
+                "poster_key": poster_key,
+                "track_id": track_id,
+                "ocr_done": bool(poster.get("ocr_done", False)),
+                "ocr_text": details.get("text") or poster.get("detected_text", ""),
+                "avg_conf": details.get("avg_conf", ""),
+                "method": details.get("method", ""),
+                "line_count": details.get("line_count", len(lines)),
+                "raw_region_count": details.get("raw_count", ""),
+                "used_inverted": bool(details.get("used_inverted", False)),
+                "detector_quality": meta.get("quality", ""),
+                "detector_conf": meta.get("score", ""),
+                "seen_count": meta.get("seen_count", ""),
+                "version": meta.get("version", ""),
+                "frame_index": meta.get("frame_index", meta.get("best_frame_index", "")),
+                "bbox_json": self.to_json_cell(bbox_value),
+                "crop_width": crop_w,
+                "crop_height": crop_h,
+                "track_meta_json": self.to_json_cell(safe_meta),
+            }
+            poster_rows.append(summary_row)
+
+            json_line_rows = []
+            for line_number, line in enumerate(lines, 1):
+                if not isinstance(line, dict):
+                    continue
+                line_row = {
+                    "exported_at": exported_at,
+                    "source_video": source_video,
+                    "gallery_rank": rank,
+                    "poster_key": poster_key,
+                    "track_id": track_id,
+                    "line_index": line.get("index", line_number),
+                    "row_index": line.get("row_index", ""),
+                    "word_index": line.get("word_index", ""),
+                    "line_text": line.get("text", ""),
+                    "line_conf": line.get("conf", ""),
+                    "method": line.get("method", ""),
+                    "parseq_text": line.get("parseq_text", ""),
+                    "parseq_conf": line.get("parseq_conf", ""),
+                    "easyocr_text": line.get("easyocr_text", ""),
+                    "easyocr_conf": line.get("easyocr_conf", ""),
+                    "line_break_after": bool(line.get("line_break_after", False)),
+                    "box_json": self.to_json_cell(line.get("box")),
+                }
+                line_rows.append(line_row)
+                json_line_rows.append(dict(line_row))
+
+            json_posters.append({
+                "summary": dict(summary_row),
+                "lines": json_line_rows,
+            })
+
+        payload = {
+            "exported_at": exported_at,
+            "source_video": source_video,
+            "source_path": source_path,
+            "poster_count": len(poster_rows),
+            "line_count": len(line_rows),
+            "notes": "Comparison export only: no captions, thumbnails, crop arrays, or full crop histories included.",
+            "posters": json_posters,
+        }
+        return poster_rows, line_rows, payload
+
+    def poster_summary_export_fields(self):
+        return [
+            "exported_at",
+            "source_video",
+            "source_path",
+            "gallery_rank",
+            "poster_key",
+            "track_id",
+            "ocr_done",
+            "ocr_text",
+            "avg_conf",
+            "method",
+            "line_count",
+            "raw_region_count",
+            "used_inverted",
+            "detector_quality",
+            "detector_conf",
+            "seen_count",
+            "version",
+            "frame_index",
+            "bbox_json",
+            "crop_width",
+            "crop_height",
+            "track_meta_json",
+        ]
+
+    def ocr_line_export_fields(self):
+        return [
+            "exported_at",
+            "source_video",
+            "gallery_rank",
+            "poster_key",
+            "track_id",
+            "line_index",
+            "row_index",
+            "word_index",
+            "line_text",
+            "line_conf",
+            "method",
+            "parseq_text",
+            "parseq_conf",
+            "easyocr_text",
+            "easyocr_conf",
+            "line_break_after",
+            "box_json",
+        ]
+
+    def write_csv(self, path, rows, fieldnames):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def image_input_size(self, image_input):
+        try:
+            if isinstance(image_input, (str, Path)):
+                with Image.open(image_input) as img:
+                    return int(img.width), int(img.height)
+            if image_input is not None and hasattr(image_input, "shape"):
+                height, width = image_input.shape[:2]
+                return int(width), int(height)
+        except Exception:
+            pass
+        return "", ""
+
+    def filtered_track_meta_for_export(self, meta):
+        if not isinstance(meta, dict):
+            return {}
+        skip = {"crop", "all_crops", "image", "image_array", "frame", "preview"}
+        keep = {}
+        for key, value in meta.items():
+            if key in skip:
+                continue
+            if isinstance(value, dict) and any(k in value for k in skip):
+                value = {k: v for k, v in value.items() if k not in skip}
+            keep[key] = self.json_safe(value)
+        return keep
+
+    def to_json_cell(self, value):
+        if value is None:
+            return ""
+        if isinstance(value, str) and value == "":
+            return ""
+        return json.dumps(self.json_safe(value), ensure_ascii=False)
+
+    def json_safe(self, value):
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, Path):
+            return str(value)
+        if hasattr(value, "tolist"):
+            try:
+                return self.json_safe(value.tolist())
+            except Exception:
+                pass
+        if isinstance(value, dict):
+            out = {}
+            for key, item in value.items():
+                if key in {"crop", "all_crops", "image", "image_array", "frame", "preview"}:
+                    continue
+                out[str(key)] = self.json_safe(item)
+            return out
+        if isinstance(value, (list, tuple, set)):
+            return [self.json_safe(item) for item in value]
+        try:
+            return value.item()
+        except Exception:
+            return str(value)
+
+    def _safe_filename(self, value):
+        text = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in str(value or "export"))
+        text = text.strip("_")
+        return text or "export"
 
     def clear_gallery(self):
         self.last_detector_frame = None
@@ -1590,6 +2202,21 @@ class PosterReaderApp(QWidget):
     def closeEvent(self, event):
         self.stop_current_model_worker(wait_ms=1000, disconnect=True)
         self.stop_post_processing_workers(wait_ms=1000, disconnect=True)
+        if self.ocr_warmup_worker is not None:
+            try:
+                self.ocr_warmup_worker.status_changed.disconnect(self.on_ocr_warmup_status)
+            except Exception:
+                pass
+            try:
+                self.ocr_warmup_worker.finished_loading.disconnect(self.on_ocr_warmup_finished)
+            except Exception:
+                pass
+            try:
+                if not self.ocr_warmup_worker.wait(500):
+                    self.ocr_warmup_worker.terminate()
+                    self.ocr_warmup_worker.wait(500)
+            except Exception:
+                pass
         super().closeEvent(event)
 
 
